@@ -3,8 +3,8 @@
 [![CI](https://github.com/thomasmartinoa/cubetimer/actions/workflows/ci.yml/badge.svg)](https://github.com/thomasmartinoa/cubetimer/actions/workflows/ci.yml)
 
 A full-screen speedcubing timer for your terminal. Big ASCII digits, the WCA 15-second
-inspection, hold-and-release start like a Stackmat, WCA-style random-state scrambles with a
-preview of the scrambled cube, and live ao5 / ao12 / ao100 stats.
+inspection, hold-and-release start like a Stackmat, WCA-style scrambles with a preview of
+the scrambled cube for 2x2 to 7x7, and live ao5 / ao12 / ao100 stats.
 
 ![cubetimer, idle: scramble, big last time, stats and recent solves](docs/screenshots/idle.png)
 
@@ -23,11 +23,11 @@ already run.
 - **Honest time formatting.** Single solves are truncated to hundredths and averages are
   rounded, as in the WCA regulations and csTimer. 12.349 shows as `12.34`; a +2 shows as
   `14.34+`; a DNF in the list keeps its raw time, `DNF(12.34)`.
-- **Random-state scrambles.** Made the way the WCA's official scrambler (TNoodle) makes
-  them: a uniformly random cube state, solved with the two-phase algorithm in at most 21
-  moves. See [Scrambles](#scrambles).
-- **Scramble preview.** A colored net of the scrambled cube, so you can check you
-  scrambled it right.
+- **2x2 to 7x7.** Press `e` to pick the cube. Each puzzle has its own sessions and stats,
+  and its own kind of scramble, made the way the WCA's official scrambler (TNoodle) makes
+  it. See [Scrambles](#scrambles).
+- **Scramble preview.** A colored net of the scrambled cube at every size, so you can check
+  you scrambled it right; `v` shows it full screen.
 - **Live stats.** Best, mean, mo3, ao5, ao12, ao100, best ao5 and best ao12. The average
   drops the best and worst 5% (at least one each) and a DNF counts as the worst result.
 - **History.** Press `h` to browse every solve: its time, when it was done, its scramble
@@ -90,8 +90,10 @@ kitty --start-as=fullscreen cubetimer
 | `+` (or `=`) / `d` / `o` | Mark the last solve +2, DNF or OK |
 | `Backspace` | Delete the last solve (asks `y` / `n`) |
 | `h` | History: browse, mark and delete any solve |
-| `n` | New session (not while the current one is empty) |
-| `[` / `]` | Previous / next session |
+| `e` | Choose the puzzle: 2x2, 3x3, 4x4, 5x5, 6x6 or 7x7 (`2`-`7` jump straight to one) |
+| `v` | Full-screen scramble preview (any key closes) |
+| `n` | New session of the current puzzle (not while the current one is empty) |
+| `[` / `]` | Previous / next session of the current puzzle |
 | `X` | Delete the current session and its solves (asks `y` / `n`) |
 | `i` | Turn inspection on or off |
 | `f` / `F` | Next / previous digit font (`auto` first) |
@@ -100,7 +102,8 @@ kitty --start-as=fullscreen cubetimer
 | `?` or `F1` | Show all keys (`/` works too) |
 | `q` / `Ctrl-C` | Quit (`q` stops the timer if one is running; `Ctrl-C` always quits) |
 
-The mark, delete, history, session, `i` and `?` keys work only when the timer is idle.
+The mark, delete, history, puzzle, preview, session, `i` and `?` keys work only when the
+timer is idle.
 The font, `p` and bell keys work any time except while the clock is running, when any key
 stops it.
 
@@ -182,21 +185,33 @@ to try other text.
 
 ## Scrambles
 
-WCA Regulation 4b3 asks for "a random state from all states that require at least 2 moves
-to solve". cubetimer follows the method of TNoodle, the WCA's official scramble program:
+Each puzzle is scrambled the way TNoodle, the WCA's official scramble program, does it.
 
-1. pick a cube state uniformly at random from all 43 quintillion legal states;
-2. throw it away if it is solved or one move from solved;
-3. solve it with Kociemba's two-phase algorithm, in at most 21 moves;
-4. show the inverse of that solution as the scramble.
+| Puzzle | Method |
+|---|---|
+| 2x2 | A uniformly random state out of all 3,674,160, kept only if it needs at least 4 moves (Regulation 4b3b). The scramble is the inverse of a random shortest solution, found from a table of the exact distance of every state, so it is as short as it can be (at most 11 moves). |
+| 3x3 | A uniformly random state out of all 43 quintillion, kept only if it needs at least 2 moves (Regulation 4b3), solved with Kociemba's two-phase algorithm in at most 21 moves; the scramble is the inverse of that solution. Usually 19 to 21 moves. |
+| 4x4 | 40 random moves: outer turns on every face and wide turns (`Uw`, `Rw`, `Fw`). |
+| 5x5 | 60 random moves with outer and wide turns on every face. |
+| 6x6 | 80 random moves; also `3Rw`-type turns, on R, U and F. |
+| 7x7 | 100 random moves; `3Rw`-type turns on every face. |
 
-So every state is equally likely, which random-move scrambles can't promise. Scrambles are
-usually 19 to 21 moves. The solver's tables take about 0.15 s to build when the program
-starts; the timer shows at once and the first scramble appears a moment later. After that
-the next scramble is prepared in the background while you solve.
+Random-state scrambles make every state equally likely, which random moves can't promise.
+For 5x5, 6x6 and 7x7 random moves *are* the WCA method. For 4x4 TNoodle uses a random
+state; cubetimer uses random moves there (a random-state 4x4 needs a much larger solver),
+so its 4x4 scrambles are good for practice but not identical to TNoodle's.
+
+The 3x3 solver's tables take about 0.15 s to build when the program starts; the timer
+shows at once and the first scramble appears a moment later. After that the next scramble
+is prepared in the background while you solve. The 2x2 distance table (3.7 million states)
+is built the first time you pick the 2x2, in about half a second, also in the background.
 
 This is the same method, not the same program: for practice it is equivalent, but official
 competitions must use TNoodle itself (Regulation 4b).
+
+![the puzzle picker over the timer, and the full-screen preview of a 7x7 scramble](docs/screenshots/picker.png)
+
+![a 7x7 scramble shown full screen](docs/screenshots/preview-7x7.png)
 
 ## Other terminals
 
@@ -238,7 +253,8 @@ The first line should say `keyboard enhancement: ON`.
 
 ## Limitations
 
-- 3x3 only.
+- Cubes only: no Pyraminx, Skewb, Megaminx, Clock or Square-1.
+- 4x4 scrambles are random-move, not random-state.
 - No import from csTimer or other timers (export to CSV is supported), no session names,
   and no Bluetooth smart cubes.
 - The hold time before the timer is ready is fixed at 0.3 s.
@@ -248,14 +264,15 @@ The first line should say `keyboard enhancement: ON`.
 ## Development
 
 ```sh
-cargo test                 # cube model, solver, scrambles, formatting, stats, fonts, state machine, layouts
+cargo test                 # cube models, solvers, scrambles, formatting, stats, fonts, state machine, layouts
 cargo clippy --all-targets -- -D warnings
 cargo run --example keytest
 cargo run --release --example scramblebench -- 2000   # solver speed and scramble lengths
 ```
 
-The code is split by job: `cube.rs` (the cube at the piece level), `twophase.rs` (the
-solver), `scramble.rs`, `fmt.rs` (time formatting), `stats.rs` (averages), `font.rs`
+The code is split by job: `cube.rs` (the 3x3 at the piece level), `twophase.rs` (the 3x3
+solver), `nxn.rs` (cubes of any size as stickers in space), `twobytwo.rs` (the 2x2 state
+table), `puzzle.rs`, `scramble.rs`, `fmt.rs` (time formatting), `stats.rs` (averages), `font.rs`
 (digit fonts), `store.rs` (sessions on disk), `app.rs` (state machine) and `ui.rs`
 (drawing). `term.rs` owns raw mode and the keyboard protocol, and restores the terminal on
 exit, on panic and on signals.

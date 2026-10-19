@@ -252,6 +252,7 @@ impl Cube {
 /// Stickers of each corner position, clockwise starting from the U or D
 /// sticker. Faces are numbered U R F D L B and each face's stickers 0..9 row
 /// by row, in the usual net: U above F, L F R B in a row, D below F.
+#[cfg(test)]
 const CORNER_FACELETS: [[usize; 3]; 8] = [
     [8, 9, 20],
     [6, 18, 38],
@@ -262,6 +263,7 @@ const CORNER_FACELETS: [[usize; 3]; 8] = [
     [33, 53, 42],
     [35, 17, 51],
 ];
+#[cfg(test)]
 const EDGE_FACELETS: [[usize; 2]; 12] = [
     [5, 10],
     [7, 19],
@@ -277,6 +279,7 @@ const EDGE_FACELETS: [[usize; 2]; 12] = [
     [48, 14],
 ];
 /// The face colors of each corner and edge piece, in the same sticker order.
+#[cfg(test)]
 const CORNER_COLORS: [[u8; 3]; 8] = [
     [0, 1, 2],
     [0, 2, 4],
@@ -287,6 +290,7 @@ const CORNER_COLORS: [[u8; 3]; 8] = [
     [3, 5, 4],
     [3, 1, 5],
 ];
+#[cfg(test)]
 const EDGE_COLORS: [[u8; 2]; 12] = [
     [0, 1],
     [0, 2],
@@ -302,6 +306,9 @@ const EDGE_COLORS: [[u8; 2]; 12] = [
     [5, 1],
 ];
 
+/// Sticker view of the cube, kept as the reference the general N×N model in
+/// `nxn.rs` is tested against.
+#[cfg(test)]
 impl Cube {
     /// The color (as a face number, U R F D L B) of all 54 stickers, face by
     /// face: sticker `9 * face + row * 3 + column`.
@@ -353,7 +360,17 @@ fn rank(p: &[u8]) -> usize {
     r
 }
 
+/// Moves written out as `R U2 F'`.
+pub fn format(moves: &[Move]) -> String {
+    moves
+        .iter()
+        .map(Move::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Parse a move sequence like `R U2 F'`.
+#[cfg(test)]
 pub fn parse(seq: &str) -> Option<Vec<Move>> {
     seq.split_whitespace()
         .map(|tok| {

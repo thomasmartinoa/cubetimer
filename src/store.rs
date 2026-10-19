@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::fmt;
+use crate::puzzle::{self, Puzzle};
 use crate::stats::{Penalty, TimeResult};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,9 +42,36 @@ impl Solve {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub solves: Vec<Solve>,
+    /// WCA event id (`333`, `222`, ...). Files from before puzzles existed
+    /// have none, and those sessions are 3x3.
+    #[serde(default = "default_puzzle_id")]
+    pub puzzle: String,
+}
+
+fn default_puzzle_id() -> String {
+    puzzle::DEFAULT_ID.into()
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Session::new(Puzzle::Cube3)
+    }
+}
+
+impl Session {
+    pub fn new(puzzle: Puzzle) -> Session {
+        Session {
+            solves: Vec::new(),
+            puzzle: puzzle.id().into(),
+        }
+    }
+
+    pub fn puzzle(&self) -> Puzzle {
+        Puzzle::from_id_or_default(&self.puzzle)
+    }
 }
 
 /// Preferences that survive a restart.
@@ -101,6 +129,18 @@ impl Data {
         &self.sessions[self.current].solves
     }
 
+    /// The puzzle of the session being timed.
+    pub fn puzzle(&self) -> Puzzle {
+        self.sessions[self.current].puzzle()
+    }
+
+    /// Indices of every session of `puzzle`, in order.
+    pub fn sessions_of(&self, puzzle: Puzzle) -> Vec<usize> {
+        (0..self.sessions.len())
+            .filter(|&i| self.sessions[i].puzzle() == puzzle)
+            .collect()
+    }
+
     pub fn solves_mut(&mut self) -> &mut Vec<Solve> {
         &mut self.sessions[self.current].solves
     }
@@ -124,7 +164,7 @@ pub fn to_csv(data: &Data) -> String {
         }
     };
     let secs = |ms: u64| format!("{}.{:03}", ms / 1000, ms % 1000);
-    let mut out = String::from("session,solve,time,penalty,result,scramble,date\n");
+    let mut out = String::from("session,puzzle,solve,time,penalty,result,scramble,date\n");
     for (si, session) in data.sessions.iter().enumerate() {
         for (i, s) in session.solves.iter().enumerate() {
             let penalty = match s.penalty {
@@ -137,8 +177,9 @@ pub fn to_csv(data: &Data) -> String {
                 TimeResult::Dnf => "DNF".into(),
             };
             out += &format!(
-                "{},{},{},{penalty},{result},{},{}\n",
+                "{},{},{},{},{penalty},{result},{},{}\n",
                 si + 1,
+                session.puzzle().name(),
                 i + 1,
                 secs(s.ms),
                 field(&s.scramble),
@@ -327,9 +368,15 @@ mod tests {
     fn csv_export() {
         let csv = to_csv(&sample());
         let lines: Vec<&str> = csv.lines().collect();
-        assert_eq!(lines[0], "session,solve,time,penalty,result,scramble,date");
-        assert_eq!(lines[1], "1,1,12.340,+2,14.340,R U,1970-01-01T00:00:07Z");
-        assert_eq!(lines[2], "1,2,9.990,dnf,DNF,F2,1970-01-01T00:00:08Z");
+        assert_eq!(
+            lines[0],
+            "session,puzzle,solve,time,penalty,result,scramble,date"
+        );
+        assert_eq!(
+            lines[1],
+            "1,3x3,1,12.340,+2,14.340,R U,1970-01-01T00:00:07Z"
+        );
+        assert_eq!(lines[2], "1,3x3,2,9.990,dnf,DNF,F2,1970-01-01T00:00:08Z");
         assert_eq!(lines.len(), 3); // the second session is empty
     }
 
@@ -399,5 +446,54 @@ mod tests {
         save(&path, &Data::default()).unwrap();
         save(&path, &sample()).unwrap();
         assert_eq!(load(&path).data, sample());
+    }
+
+    #[test]
+    fn old_files_without_puzzles_load_as_3x3() {
+        let dir = temp_dir("old-format");
+        let path = dir.join("sessions.json");
+        fs::write(
+            &path,
+            r#"{"sessions":[{"solves":[{"ms":9000,"penalty":"ok","scramble":"R","ts":1}]},{"solves":[]}],"current":1}"#,
+        )
+        .unwrap();
+        let data = read(&path).unwrap();
+        assert!(data.sessions.iter().all(|s| s.puzzle() == Puzzle::Cube3));
+        assert_eq!(data.sessions[0].puzzle, "333");
+        assert_eq!(data.sessions[0].solves[0].ms, 9_000);
+    }
+
+    #[test]
+    fn puzzles_are_saved_and_unknown_ones_read_as_3x3() {
+        let dir = temp_dir("puzzles");
+        let path = dir.join("sessions.json");
+        let mut data = Data::default();
+        data.sessions.push(Session::new(Puzzle::Cube5));
+        data.sessions.push(Session {
+            solves: vec![],
+            puzzle: "from-the-future".into(),
+        });
+        save(&path, &data).unwrap();
+        let back = read(&path).unwrap();
+        assert_eq!(back.sessions[1].puzzle(), Puzzle::Cube5);
+        assert_eq!(back.sessions[2].puzzle(), Puzzle::Cube3);
+        assert_eq!(back.sessions[2].puzzle, "from-the-future"); // kept as written
+        assert_eq!(back.sessions_of(Puzzle::Cube3), vec![0, 2]);
+        assert_eq!(back.sessions_of(Puzzle::Cube5), vec![1]);
+        assert!(back.sessions_of(Puzzle::Cube2).is_empty());
+    }
+
+    #[test]
+    fn csv_names_the_puzzle() {
+        let mut data = Data::default();
+        data.sessions.push(Session::new(Puzzle::Cube4));
+        data.current = 1;
+        data.solves_mut().push(Solve {
+            ms: 50_000,
+            penalty: Penalty::Ok,
+            scramble: "Rw".into(),
+            ts: 0,
+        });
+        assert!(to_csv(&data).contains("\n2,4x4,1,50.000,ok,50.000,Rw,"));
     }
 }

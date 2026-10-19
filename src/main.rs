@@ -2,10 +2,13 @@ mod app;
 mod cube;
 mod fmt;
 mod font;
+mod nxn;
+mod puzzle;
 mod scramble;
 mod stats;
 mod store;
 mod term;
+mod twobytwo;
 mod twophase;
 mod ui;
 

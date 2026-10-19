@@ -12,6 +12,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 
 use crate::fmt::{self, Precision, RunDisplay};
 use crate::font;
+use crate::puzzle::{self, Puzzle};
 use crate::scramble::Scrambler;
 use crate::stats::{self, Penalty, Summary, TimeResult};
 use crate::store::{self, Data, Loaded, Session, Settings, Solve};
@@ -99,6 +100,10 @@ pub struct App {
     pub history: Option<usize>,
     /// The key help overlay is open.
     pub show_help: bool,
+    /// The puzzle picker is open with this puzzle highlighted.
+    pub picker: Option<usize>,
+    /// The full-screen scramble preview is open.
+    pub show_preview: bool,
     /// The key last pressed and not yet released (with release events only),
     /// to tell auto-repeat from a new press.
     down: Option<KeyCode>,
@@ -131,6 +136,8 @@ impl App {
             history: None,
             confirm_session_delete: false,
             show_help: false,
+            picker: None,
+            show_preview: false,
             down: None,
             pb_flash: None,
             inspection_on: true,
@@ -140,7 +147,7 @@ impl App {
             bell: false,
             font: font::index_of(font::DEFAULT),
             scramble: String::new(),
-            scrambler: Scrambler::new(),
+            scrambler: Scrambler::new(Puzzle::Cube3),
             quit: false,
             warned: 0,
         };
@@ -159,7 +166,20 @@ impl App {
         self.font = font::index_of(&settings.font);
         self.inspection_on = settings.inspection;
         self.bell = settings.bell;
+        self.reset_scrambler();
         self
+    }
+
+    /// The puzzle being timed.
+    pub fn puzzle(&self) -> Puzzle {
+        self.data.puzzle()
+    }
+
+    /// Start making scrambles for the current puzzle (after switching puzzle
+    /// or loading a file whose current session isn't a 3x3).
+    fn reset_scrambler(&mut self) {
+        self.scrambler = Scrambler::new(self.puzzle());
+        self.scramble = self.scrambler.try_next().unwrap_or_default();
     }
 
     pub fn solves(&self) -> &[Solve] {
@@ -284,7 +304,11 @@ impl App {
             }
             return;
         }
-        if std::mem::take(&mut self.show_help) {
+        if std::mem::take(&mut self.show_help) || std::mem::take(&mut self.show_preview) {
+            return;
+        }
+        if let Some(selected) = self.picker {
+            self.picker_key(code, selected);
             return;
         }
         if let Some(selected) = self.history {
@@ -308,6 +332,15 @@ impl App {
             KeyCode::Char('h') if idle => self.history = last,
             // `/` too: WezTerm sends Shift+/ without the SHIFT flag
             KeyCode::Char('?' | '/') | KeyCode::F(1) if idle => self.show_help = true,
+            KeyCode::Char('e') if idle => {
+                self.picker = Some(
+                    puzzle::ALL
+                        .iter()
+                        .position(|&p| p == self.puzzle())
+                        .unwrap_or(1),
+                );
+            }
+            KeyCode::Char('v') if idle => self.show_preview = true,
             KeyCode::Char('n') if idle => self.new_session(),
             KeyCode::Char('X') if idle => self.confirm_session_delete = true,
             KeyCode::Char('[') if idle => self.switch_session(-1),
@@ -446,29 +479,82 @@ impl App {
         if self.solves().is_empty() {
             return;
         }
-        self.data.sessions.push(Session::default());
+        self.data.sessions.push(Session::new(self.puzzle()));
         self.data.current = self.data.sessions.len() - 1;
         self.persist();
     }
 
-    /// Remove the current session and all its solves. The last session left
-    /// is emptied instead, so there is always one.
+    /// Remove the current session and all its solves. If it is the last
+    /// session of its puzzle it is emptied instead, so every puzzle you have
+    /// used keeps a session.
     fn delete_session(&mut self) {
-        let sessions = &mut self.data.sessions;
-        if sessions.len() > 1 {
-            sessions.remove(self.data.current);
-            self.data.current = self.data.current.min(sessions.len() - 1);
+        let puzzle = self.puzzle();
+        let of_puzzle = self.data.sessions_of(puzzle);
+        if of_puzzle.len() > 1 {
+            let at = of_puzzle
+                .iter()
+                .position(|&i| i == self.data.current)
+                .unwrap_or(0);
+            self.data.sessions.remove(self.data.current);
+            // stay on the same puzzle: the session that took its place, or
+            // the one before if it was the last
+            let remaining = self.data.sessions_of(puzzle);
+            self.data.current = remaining[at.min(remaining.len() - 1)];
         } else {
-            sessions[0] = Session::default();
+            self.data.sessions[self.data.current] = Session::new(puzzle);
         }
         self.persist();
     }
 
+    /// Move to the previous (-1) or next (+1) session of the same puzzle.
     fn switch_session(&mut self, step: isize) {
-        let next = self.data.current.checked_add_signed(step);
-        if let Some(i) = next.filter(|&i| i < self.data.sessions.len()) {
+        let of_puzzle = self.data.sessions_of(self.puzzle());
+        let at = of_puzzle
+            .iter()
+            .position(|&i| i == self.data.current)
+            .unwrap_or(0);
+        if let Some(&i) = at.checked_add_signed(step).and_then(|k| of_puzzle.get(k)) {
             self.data.current = i;
             self.persist();
+        }
+    }
+
+    /// Switch to `puzzle`: its most recent session, or a new one if you have
+    /// never timed it.
+    fn select_puzzle(&mut self, puzzle: Puzzle) {
+        if puzzle == self.puzzle() {
+            return;
+        }
+        let existing = self.data.sessions_of(puzzle).last().copied();
+        self.data.current = existing.unwrap_or_else(|| {
+            self.data.sessions.push(Session::new(puzzle));
+            self.data.sessions.len() - 1
+        });
+        self.history = None;
+        self.reset_scrambler();
+        self.persist();
+    }
+
+    /// Keys while the puzzle picker is open.
+    fn picker_key(&mut self, code: KeyCode, selected: usize) {
+        let last = puzzle::ALL.len() - 1;
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => self.picker = Some(selected.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => self.picker = Some((selected + 1).min(last)),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.picker = None;
+                self.select_puzzle(puzzle::ALL[selected]);
+            }
+            // 2..7 pick a cube by its size
+            KeyCode::Char(c @ '2'..='7') => {
+                self.picker = None;
+                let size = c.to_digit(10).unwrap_or(3) as usize;
+                if let Some(&p) = puzzle::ALL.iter().find(|p| p.size() == size) {
+                    self.select_puzzle(p);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('e' | 'q') => self.picker = None,
+            _ => {}
         }
     }
 
@@ -1509,5 +1595,220 @@ mod tests {
         key(&mut app, KeyCode::Char('y'));
         assert_eq!((app.data.current, app.data.sessions.len()), (0, 1));
         assert_eq!(app.solves()[0].ms, 1_000);
+    }
+
+    #[test]
+    fn the_picker_switches_puzzle_and_keeps_each_puzzles_solves_apart() {
+        let mut app = with_solves(&[1_000, 2_000]);
+        assert_eq!(app.puzzle(), Puzzle::Cube3);
+        key(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.picker, Some(1)); // opens on the current puzzle
+        key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.picker, None);
+        assert_eq!(app.puzzle(), Puzzle::Cube4);
+        assert!(app.solves().is_empty(), "a new 4x4 session");
+        app.data
+            .solves_mut()
+            .push(Solve::new(50_000, Penalty::Ok, String::new()));
+        // back to 3x3: its own session, untouched
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.puzzle(), Puzzle::Cube3);
+        assert_eq!(app.solves().len(), 2);
+        // and 4x4 again finds its session instead of making another
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.solves().len(), 1);
+        assert_eq!(app.data.sessions.len(), 2);
+    }
+
+    #[test]
+    fn the_picker_can_be_driven_by_arrows_and_cancelled() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Up); // 3x3 -> 2x2
+        key(&mut app, KeyCode::Up); // stays at the top
+        assert_eq!(app.picker, Some(0));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.puzzle(), Puzzle::Cube2);
+        key(&mut app, KeyCode::Char('e'));
+        for _ in 0..10 {
+            key(&mut app, KeyCode::Down);
+        }
+        assert_eq!(app.picker, Some(puzzle::ALL.len() - 1)); // stops at 7x7
+        key(&mut app, KeyCode::Esc);
+        assert_eq!((app.picker, app.puzzle()), (None, Puzzle::Cube2));
+    }
+
+    #[test]
+    fn picker_keys_do_not_leak_to_the_timer() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, SPACE); // picks the highlighted 3x3, doesn't start inspection
+        assert_eq!(app.state, State::Idle);
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn picking_the_current_puzzle_changes_nothing() {
+        let mut app = with_solves(&[1_000]);
+        settle(&mut app);
+        let before = app.scramble.clone();
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.scramble, before);
+        assert_eq!(app.data.sessions.len(), 1);
+    }
+
+    #[test]
+    fn a_new_puzzle_gets_its_own_kind_of_scramble() {
+        use crate::nxn;
+        let mut app = App::new(true);
+        for (digit, size) in [('2', 2), ('5', 5), ('7', 7), ('3', 3)] {
+            key(&mut app, KeyCode::Char('e'));
+            key(&mut app, KeyCode::Char(digit));
+            settle(&mut app);
+            let moves = nxn::parse(&app.scramble).unwrap();
+            match size {
+                2 => assert!(moves.len() <= 11),
+                3 => assert!(moves.len() <= 21),
+                n => assert_eq!(moves.len(), nxn::scramble_length(n)),
+            }
+        }
+    }
+
+    #[test]
+    fn switching_puzzle_clears_the_old_scramble_until_the_new_one_arrives() {
+        let mut app = App::new(true);
+        settle(&mut app);
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('6'));
+        // never the old 3x3 scramble on a 6x6
+        assert!(
+            app.scramble.is_empty() || app.scramble.contains('w'),
+            "{}",
+            app.scramble
+        );
+    }
+
+    #[test]
+    fn solves_keep_the_scramble_of_their_own_puzzle() {
+        let t = Instant::now();
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('5'));
+        settle(&mut app);
+        let scramble = app.scramble.clone();
+        solve_at(&mut app, t, 5_000);
+        assert_eq!(app.solves()[0].scramble, scramble);
+        assert_eq!(app.data.sessions[app.data.current].puzzle, "555");
+    }
+
+    #[test]
+    fn sessions_navigate_and_start_within_the_current_puzzle() {
+        let mut app = with_solves(&[1_000]); // 3x3 session 0
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('2')); // 2x2 session 1
+        app.data
+            .solves_mut()
+            .push(Solve::new(3_000, Penalty::Ok, String::new()));
+        key(&mut app, KeyCode::Char('n')); // 2x2 session 2
+        assert_eq!(app.data.sessions[app.data.current].puzzle, "222");
+        app.data
+            .solves_mut()
+            .push(Solve::new(4_000, Penalty::Ok, String::new()));
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('3'));
+        key(&mut app, KeyCode::Char('n')); // 3x3 session, appended after the 2x2 ones
+        app.data
+            .solves_mut()
+            .push(Solve::new(2_000, Penalty::Ok, String::new()));
+        assert_eq!(app.data.sessions.len(), 4);
+        // [ goes to the other 3x3 session, skipping both 2x2 ones
+        key(&mut app, KeyCode::Char('['));
+        assert_eq!(app.solves()[0].ms, 1_000);
+        key(&mut app, KeyCode::Char('['));
+        assert_eq!(app.solves()[0].ms, 1_000, "no earlier 3x3 session");
+        key(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.solves()[0].ms, 2_000);
+        key(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.solves()[0].ms, 2_000, "no later 3x3 session");
+    }
+
+    #[test]
+    fn deleting_a_session_never_leaves_its_puzzle() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('4'));
+        app.data
+            .solves_mut()
+            .push(Solve::new(9_000, Penalty::Ok, String::new()));
+        key(&mut app, KeyCode::Char('X'));
+        key(&mut app, KeyCode::Char('y'));
+        // the only 4x4 session is emptied, not removed, and we stay on 4x4
+        assert_eq!(app.puzzle(), Puzzle::Cube4);
+        assert!(app.solves().is_empty());
+        assert_eq!(app.data.sessions.len(), 2);
+        // with two 4x4 sessions, deleting one lands on the other 4x4
+        app.data
+            .solves_mut()
+            .push(Solve::new(9_000, Penalty::Ok, String::new()));
+        key(&mut app, KeyCode::Char('n'));
+        app.data
+            .solves_mut()
+            .push(Solve::new(8_000, Penalty::Ok, String::new()));
+        key(&mut app, KeyCode::Char('X'));
+        key(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.puzzle(), Puzzle::Cube4);
+        assert_eq!(app.solves()[0].ms, 9_000);
+        assert_eq!(app.data.sessions.len(), 2);
+    }
+
+    #[test]
+    fn the_puzzle_survives_a_restart() {
+        let dir =
+            std::env::temp_dir().join(format!("cubetimer-puzzle-test-{}", std::process::id()));
+        let path = dir.join("sessions.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new(true).with_storage(path.clone(), store::load(&path));
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('5'));
+        let mut app = App::new(true).with_storage(path.clone(), store::load(&path));
+        assert_eq!(app.puzzle(), Puzzle::Cube5);
+        settle(&mut app);
+        assert_eq!(crate::nxn::parse(&app.scramble).unwrap().len(), 60);
+    }
+
+    #[test]
+    fn full_preview_opens_with_v_and_any_key_closes_it() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('v'));
+        assert!(app.show_preview);
+        key(&mut app, SPACE);
+        assert!(!app.show_preview);
+        assert_eq!(app.state, State::Idle);
+        // not while inspecting
+        key(&mut app, SPACE);
+        key(&mut app, KeyCode::Char('v'));
+        assert!(!app.show_preview);
+    }
+}
+
+/// Helpers for tests in other modules.
+#[cfg(test)]
+pub mod tests_support {
+    use super::*;
+
+    /// Switch to the cube of the given size digit, as the picker would.
+    pub fn set_puzzle(app: &mut App, digit: char) {
+        let size = digit.to_digit(10).unwrap() as usize;
+        let p = puzzle::ALL
+            .iter()
+            .copied()
+            .find(|p| p.size() == size)
+            .unwrap();
+        app.select_puzzle(p);
     }
 }
