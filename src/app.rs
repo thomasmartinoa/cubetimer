@@ -11,9 +11,10 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::fmt::{self, Precision, RunDisplay};
+use crate::font;
+use crate::scramble::Scrambler;
 use crate::stats::{self, Penalty, Summary, TimeResult};
-use crate::scramble;
-use crate::store::{self, Data, Loaded, Session, Solve};
+use crate::store::{self, Data, Loaded, Session, Settings, Solve};
 use crate::ui;
 
 /// How long space must be held before the timer is ready.
@@ -31,10 +32,18 @@ const DNF_AFTER: u64 = 17_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Idle,
-    Inspection { start: Instant },
+    Inspection {
+        start: Instant,
+    },
     /// Space is held down; `inspection` is the start of the running inspection.
-    Holding { since: Instant, inspection: Option<Instant> },
-    Running { start: Instant, penalty: Penalty },
+    Holding {
+        since: Instant,
+        inspection: Option<Instant>,
+    },
+    Running {
+        start: Instant,
+        penalty: Penalty,
+    },
 }
 
 /// What the big display should look like; `ui` maps tones to colors.
@@ -66,8 +75,12 @@ pub struct App {
     path: Option<PathBuf>,
     /// A one-line message for the footer (save errors and the like).
     pub status: Option<String>,
-    /// Waiting for y/n after Backspace.
-    pub confirm_delete: bool,
+    /// Waiting for y/n to delete this solve (an index into `solves()`).
+    pub confirm_delete: Option<usize>,
+    /// The history browser is open with this solve selected.
+    pub history: Option<usize>,
+    /// The key help overlay is open.
+    pub show_help: bool,
     /// When the last solve set a new best single; drives the flash.
     pb_flash: Option<Instant>,
     pub inspection_on: bool,
@@ -76,7 +89,11 @@ pub struct App {
     pub run_display: RunDisplay,
     pub precision: Precision,
     pub bell: bool,
+    /// The digit font choice (0 is `auto`), see `font::name_at`.
+    pub font: usize,
+    /// The scramble to do next; empty while the first one is being made.
     pub scramble: String,
+    scrambler: Scrambler,
     pub quit: bool,
     /// Inspection warnings already announced: 0 none, 1 at 8 s, 2 at 12 s.
     warned: u8,
@@ -84,22 +101,30 @@ pub struct App {
 
 impl App {
     pub fn new(enhanced: bool) -> Self {
-        Self {
+        let mut app = Self {
             state: State::Idle,
             data: Data::default(),
             path: None,
             status: None,
-            confirm_delete: false,
+            confirm_delete: None,
+            history: None,
+            show_help: false,
             pb_flash: None,
             inspection_on: true,
             enhanced,
             run_display: RunDisplay::default(),
             precision: Precision::default(),
             bell: false,
-            scramble: scramble::generate(),
+            font: font::index_of(font::DEFAULT),
+            scramble: String::new(),
+            scrambler: Scrambler::new(),
             quit: false,
             warned: 0,
-        }
+        };
+        // Don't wait for the solver's tables: draw now, show the scramble
+        // when it arrives (`tick` picks it up).
+        app.scramble = app.scrambler.try_next().unwrap_or_default();
+        app
     }
 
     /// Use `path` for saving and start from what was loaded.
@@ -107,6 +132,10 @@ impl App {
         self.path = Some(path);
         self.data = loaded.data;
         self.status = loaded.warning;
+        let settings = &self.data.settings;
+        self.font = font::index_of(&settings.font);
+        self.inspection_on = settings.inspection;
+        self.bell = settings.bell;
         self
     }
 
@@ -115,6 +144,11 @@ impl App {
     }
 
     fn persist(&mut self) {
+        self.data.settings = Settings {
+            font: font::name_at(self.font).into(),
+            inspection: self.inspection_on,
+            bell: self.bell,
+        };
         if let Some(path) = &self.path
             && let Err(e) = store::save(path, &self.data)
         {
@@ -147,7 +181,9 @@ impl App {
     /// How long the loop may wait for input; `None` blocks until a key.
     fn tick_interval(&self) -> Option<Duration> {
         match self.state {
-            State::Idle if self.pb_flash.is_some() => Some(Duration::from_millis(50)),
+            State::Idle if self.pb_flash.is_some() || self.scramble.is_empty() => {
+                Some(Duration::from_millis(50))
+            }
             State::Idle => None,
             State::Inspection { .. } => Some(Duration::from_millis(50)),
             State::Holding { .. } | State::Running { .. } => Some(Duration::from_millis(16)),
@@ -164,7 +200,8 @@ impl App {
         if key.kind == KeyEventKind::Repeat {
             return;
         }
-        let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl_c =
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         if key.kind == KeyEventKind::Press && ctrl_c {
             self.quit = true;
             return;
@@ -182,29 +219,45 @@ impl App {
                 }
                 self.status = None;
                 self.pb_flash = None;
-                if std::mem::take(&mut self.confirm_delete) {
+                if let Some(i) = self.confirm_delete.take() {
                     if key.code == KeyCode::Char('y') {
-                        self.delete_last();
+                        self.delete(i);
                     }
                     return;
                 }
+                if std::mem::take(&mut self.show_help) {
+                    return;
+                }
+                if let Some(selected) = self.history {
+                    self.history_key(key.code, selected);
+                    return;
+                }
                 let idle = self.state == State::Idle;
+                let last = self.solves().len().checked_sub(1);
                 match key.code {
                     KeyCode::Char(' ') => self.space_press(now),
                     KeyCode::Esc => self.cancel(),
                     KeyCode::Char('q') => self.quit = true,
-                    KeyCode::Char('i') if idle => self.inspection_on = !self.inspection_on,
-                    KeyCode::Char('+' | '=') if idle => self.mark_last(Penalty::Plus2),
-                    KeyCode::Char('d') if idle => self.mark_last(Penalty::Dnf),
-                    KeyCode::Char('o') if idle => self.mark_last(Penalty::Ok),
-                    KeyCode::Backspace if idle && !self.solves().is_empty() => {
-                        self.confirm_delete = true;
+                    KeyCode::Char('i') if idle => {
+                        self.inspection_on = !self.inspection_on;
+                        self.persist();
                     }
+                    KeyCode::Char('+' | '=') if idle => self.mark(last, Penalty::Plus2),
+                    KeyCode::Char('d') if idle => self.mark(last, Penalty::Dnf),
+                    KeyCode::Char('o') if idle => self.mark(last, Penalty::Ok),
+                    KeyCode::Backspace if idle => self.confirm_delete = last,
+                    KeyCode::Char('h') if idle => self.history = last,
+                    KeyCode::Char('?') if idle => self.show_help = true,
                     KeyCode::Char('n') if idle => self.new_session(),
                     KeyCode::Char('[') if idle => self.switch_session(-1),
                     KeyCode::Char(']') if idle => self.switch_session(1),
                     KeyCode::Char('p') => self.run_display = self.run_display.next(),
-                    KeyCode::Char('b') => self.bell = !self.bell,
+                    KeyCode::Char('b') => {
+                        self.bell = !self.bell;
+                        self.persist();
+                    }
+                    KeyCode::Char('f') => self.cycle_font(1),
+                    KeyCode::Char('F') => self.cycle_font(-1),
                     _ => {}
                 }
             }
@@ -218,11 +271,18 @@ impl App {
                 self.warned = 0;
                 State::Inspection { start: now }
             }
-            State::Idle if self.enhanced => State::Holding { since: now, inspection: None },
-            State::Idle => State::Running { start: now, penalty: Penalty::Ok },
-            State::Inspection { start } if self.enhanced => {
-                State::Holding { since: now, inspection: Some(start) }
-            }
+            State::Idle if self.enhanced => State::Holding {
+                since: now,
+                inspection: None,
+            },
+            State::Idle => State::Running {
+                start: now,
+                penalty: Penalty::Ok,
+            },
+            State::Inspection { start } if self.enhanced => State::Holding {
+                since: now,
+                inspection: Some(start),
+            },
             State::Inspection { start } => Self::running(now, Some(start)),
             other => other,
         };
@@ -255,7 +315,10 @@ impl App {
             Some(ms) if ms >= PLUS2_AFTER => Penalty::Plus2,
             _ => Penalty::Ok,
         };
-        State::Running { start: now, penalty }
+        State::Running {
+            start: now,
+            penalty,
+        }
     }
 
     fn stop(&mut self, now: Instant) {
@@ -269,22 +332,54 @@ impl App {
             );
             self.pb_flash = new_pb.then_some(now);
             self.data.solves_mut().push(solve);
-            self.scramble = scramble::generate();
+            self.scramble = self.scrambler.try_next().unwrap_or_default();
             self.state = State::Idle;
             self.persist();
         }
     }
 
-    fn mark_last(&mut self, penalty: Penalty) {
-        if let Some(last) = self.data.solves_mut().last_mut() {
-            last.penalty = penalty;
+    /// Switch to the next (or previous) digit font and remember it.
+    fn cycle_font(&mut self, step: isize) {
+        let n = font::choices() as isize;
+        self.font = (self.font as isize + step).rem_euclid(n) as usize;
+        self.persist();
+    }
+
+    fn mark(&mut self, index: Option<usize>, penalty: Penalty) {
+        if let Some(solve) = index.and_then(|i| self.data.solves_mut().get_mut(i)) {
+            solve.penalty = penalty;
             self.persist();
         }
     }
 
-    fn delete_last(&mut self) {
-        if self.data.solves_mut().pop().is_some() {
+    fn delete(&mut self, index: usize) {
+        if index < self.solves().len() {
+            self.data.solves_mut().remove(index);
             self.persist();
+        }
+        // keep the browser on a solve that still exists
+        let len = self.solves().len();
+        self.history = self.history.filter(|_| len > 0).map(|i| i.min(len - 1));
+    }
+
+    /// Keys while the history browser is open. The list runs newest first, so
+    /// "down" moves to older solves (lower indices).
+    fn history_key(&mut self, code: KeyCode, selected: usize) {
+        let newest = self.solves().len().saturating_sub(1);
+        let to = |i: usize| Some(i.min(newest));
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => self.history = to(selected + 1),
+            KeyCode::Down | KeyCode::Char('j') => self.history = to(selected.saturating_sub(1)),
+            KeyCode::PageUp => self.history = to(selected + 10),
+            KeyCode::PageDown => self.history = to(selected.saturating_sub(10)),
+            KeyCode::Home | KeyCode::Char('g') => self.history = to(newest),
+            KeyCode::End | KeyCode::Char('G') => self.history = to(0),
+            KeyCode::Char('+' | '=') => self.mark(Some(selected), Penalty::Plus2),
+            KeyCode::Char('d') => self.mark(Some(selected), Penalty::Dnf),
+            KeyCode::Char('o') => self.mark(Some(selected), Penalty::Ok),
+            KeyCode::Backspace | KeyCode::Delete => self.confirm_delete = Some(selected),
+            KeyCode::Esc | KeyCode::Char('h' | 'q') => self.history = None,
+            _ => {}
         }
     }
 
@@ -308,12 +403,28 @@ impl App {
 
     /// Periodic work: the inspection warning bell.
     pub fn tick(&mut self, now: Instant) {
-        if self.pb_flash.is_some_and(|t| now.duration_since(t) >= PB_FLASH) {
+        if self.scramble.is_empty()
+            && let Some(s) = self.scrambler.try_next()
+        {
+            self.scramble = s;
+        }
+        if self
+            .pb_flash
+            .is_some_and(|t| now.duration_since(t) >= PB_FLASH)
+        {
             self.pb_flash = None;
         }
-        let Some(start) = self.inspection_start() else { return };
+        let Some(start) = self.inspection_start() else {
+            return;
+        };
         let ms = now.duration_since(start).as_millis() as u64;
-        let level = if ms >= WARN_12S { 2 } else if ms >= WARN_8S { 1 } else { 0 };
+        let level = if ms >= WARN_12S {
+            2
+        } else if ms >= WARN_8S {
+            1
+        } else {
+            0
+        };
         if level > self.warned {
             self.warned = level;
             if self.bell {
@@ -335,15 +446,27 @@ impl App {
     pub fn view(&self, now: Instant) -> View {
         let prec = self.precision;
         match self.state {
-            State::Idle if self.confirm_delete => View {
+            State::Idle if self.confirm_delete.is_some() => View {
                 text: self.last_text(),
                 tone: Tone::Warn12,
-                hint: "delete last solve? y / n".into(),
+                hint: self.delete_prompt(),
             },
-            State::Idle if self.pb_flash.is_some_and(|t| now.duration_since(t) < PB_FLASH) => {
+            State::Idle
+                if self
+                    .pb_flash
+                    .is_some_and(|t| now.duration_since(t) < PB_FLASH) =>
+            {
                 let elapsed = now.duration_since(self.pb_flash.unwrap_or(now)).as_millis();
-                let tone = if (elapsed / PB_BLINK_MS).is_multiple_of(2) { Tone::Pb } else { Tone::PbAlt };
-                View { text: self.last_text(), tone, hint: "new personal best!".into() }
+                let tone = if (elapsed / PB_BLINK_MS).is_multiple_of(2) {
+                    Tone::Pb
+                } else {
+                    Tone::PbAlt
+                };
+                View {
+                    text: self.last_text(),
+                    tone,
+                    hint: "new personal best!".into(),
+                }
             }
             State::Idle => {
                 let text = self.last_text();
@@ -352,7 +475,11 @@ impl App {
                     (true, false) => "hold space, release to start",
                     (false, false) => "space: start",
                 };
-                View { text, tone: Tone::Idle, hint: hint.into() }
+                View {
+                    text,
+                    tone: Tone::Idle,
+                    hint: hint.into(),
+                }
             }
             State::Inspection { start } => {
                 let ms = now.duration_since(start).as_millis() as u64;
@@ -362,12 +489,18 @@ impl App {
                     _ if self.enhanced => (Tone::Inspect, "hold space when ready"),
                     _ => (Tone::Inspect, "space: start"),
                 };
-                View { text: fmt::fmt_inspection(ms), tone, hint: hint.into() }
+                View {
+                    text: fmt::fmt_inspection(ms),
+                    tone,
+                    hint: hint.into(),
+                }
             }
             State::Holding { since, inspection } => {
                 let ready = now.duration_since(since) >= HOLD_READY;
                 let text = match inspection {
-                    Some(start) => fmt::fmt_inspection(now.duration_since(start).as_millis() as u64),
+                    Some(start) => {
+                        fmt::fmt_inspection(now.duration_since(start).as_millis() as u64)
+                    }
                     None => fmt::fmt_time(0, prec),
                 };
                 let (tone, hint) = if ready {
@@ -375,7 +508,11 @@ impl App {
                 } else {
                     (Tone::HoldWait, "hold...")
                 };
-                View { text, tone, hint: hint.into() }
+                View {
+                    text,
+                    tone,
+                    hint: hint.into(),
+                }
             }
             State::Running { start, .. } => {
                 let ms = now.duration_since(start).as_millis() as u64;
@@ -385,6 +522,15 @@ impl App {
                     hint: String::new(),
                 }
             }
+        }
+    }
+
+    /// The y/n question shown while a delete waits for confirmation.
+    pub fn delete_prompt(&self) -> String {
+        match self.confirm_delete {
+            Some(i) if i + 1 == self.solves().len() => "delete last solve? y / n".into(),
+            Some(i) => format!("delete solve {}? y / n", i + 1),
+            None => String::new(),
         }
     }
 
@@ -433,7 +579,13 @@ mod tests {
         app.on_key(press(SPACE), at(t, 5_000));
         assert!(matches!(app.state, State::Holding { .. }));
         app.on_key(release(SPACE), at(t, 5_400));
-        assert!(matches!(app.state, State::Running { penalty: Penalty::Ok, .. }));
+        assert!(matches!(
+            app.state,
+            State::Running {
+                penalty: Penalty::Ok,
+                ..
+            }
+        ));
         app.on_key(press(KeyCode::Char('x')), at(t, 17_890));
         assert_eq!(app.state, State::Idle);
         assert_eq!(app.solves().len(), 1);
@@ -457,12 +609,24 @@ mod tests {
         let mut app = App::new(true);
         app.inspection_on = false;
         app.on_key(press(SPACE), at(t, 0));
-        assert!(matches!(app.state, State::Holding { inspection: None, .. }));
+        assert!(matches!(
+            app.state,
+            State::Holding {
+                inspection: None,
+                ..
+            }
+        ));
         app.on_key(release(SPACE), at(t, 299));
         assert_eq!(app.state, State::Idle);
         app.on_key(press(SPACE), at(t, 1_000));
         app.on_key(release(SPACE), at(t, 1_300));
-        assert!(matches!(app.state, State::Running { penalty: Penalty::Ok, .. }));
+        assert!(matches!(
+            app.state,
+            State::Running {
+                penalty: Penalty::Ok,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -539,7 +703,13 @@ mod tests {
         app.on_key(press(SPACE), at(t, 0));
         assert!(matches!(app.state, State::Inspection { .. }));
         app.on_key(press(SPACE), at(t, 16_000));
-        assert!(matches!(app.state, State::Running { penalty: Penalty::Plus2, .. }));
+        assert!(matches!(
+            app.state,
+            State::Running {
+                penalty: Penalty::Plus2,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -574,7 +744,10 @@ mod tests {
     fn ctrl_c_quits_even_while_running() {
         let t = Instant::now();
         let mut app = App::new(true);
-        app.state = State::Running { start: t, penalty: Penalty::Ok };
+        app.state = State::Running {
+            start: t,
+            penalty: Penalty::Ok,
+        };
         let ev = KeyEvent::new_with_kind(
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
@@ -623,7 +796,9 @@ mod tests {
     fn idle_view_shows_the_last_solve() {
         let t = Instant::now();
         let mut app = App::new(true);
-        app.data.solves_mut().push(Solve::new(12_340, Penalty::Plus2, String::new()));
+        app.data
+            .solves_mut()
+            .push(Solve::new(12_340, Penalty::Plus2, String::new()));
         assert_eq!(app.view(t).text, "14.34+");
     }
 
@@ -634,7 +809,9 @@ mod tests {
     fn with_solves(times: &[u64]) -> App {
         let mut app = App::new(true);
         for &ms in times {
-            app.data.solves_mut().push(Solve::new(ms, Penalty::Ok, String::new()));
+            app.data
+                .solves_mut()
+                .push(Solve::new(ms, Penalty::Ok, String::new()));
         }
         app
     }
@@ -679,13 +856,13 @@ mod tests {
     fn backspace_asks_before_deleting() {
         let mut app = with_solves(&[1_000, 2_000]);
         key(&mut app, KeyCode::Backspace);
-        assert!(app.confirm_delete);
+        assert!(app.confirm_delete.is_some());
         assert_eq!(app.solves().len(), 2);
         assert_eq!(app.view(Instant::now()).hint, "delete last solve? y / n");
         key(&mut app, KeyCode::Char('y'));
         assert_eq!(app.solves().len(), 1);
         assert_eq!(app.solves()[0].ms, 1_000);
-        assert!(!app.confirm_delete);
+        assert!(app.confirm_delete.is_none());
     }
 
     #[test]
@@ -695,7 +872,7 @@ mod tests {
             key(&mut app, KeyCode::Backspace);
             key(&mut app, cancel);
             assert_eq!(app.solves().len(), 1);
-            assert!(!app.confirm_delete);
+            assert!(app.confirm_delete.is_none());
             assert_eq!(app.state, State::Idle);
             assert!(!app.quit);
         }
@@ -705,7 +882,7 @@ mod tests {
     fn backspace_with_no_solves_does_not_ask() {
         let mut app = App::new(true);
         key(&mut app, KeyCode::Backspace);
-        assert!(!app.confirm_delete);
+        assert!(app.confirm_delete.is_none());
     }
 
     #[test]
@@ -726,17 +903,42 @@ mod tests {
         assert_eq!(app.data.current, 1);
     }
 
+    /// Tick until the background scramble arrives.
+    fn settle(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.scramble.is_empty() {
+            assert!(Instant::now() < deadline, "no scramble in 10 s");
+            app.tick(Instant::now());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn stopping_a_solve_makes_a_new_scramble() {
         let t = Instant::now();
         let mut app = App::new(true);
+        settle(&mut app);
         app.inspection_on = false;
         let before = app.scramble.clone();
         app.on_key(press(SPACE), t);
         app.on_key(release(SPACE), at(t, 400));
         app.on_key(press(SPACE), at(t, 5_000));
+        settle(&mut app);
         assert_ne!(app.scramble, before);
         assert_eq!(app.solves()[0].scramble, before);
+    }
+
+    #[test]
+    fn startup_does_not_wait_for_a_scramble() {
+        // App::new returns at once; while the scramble is missing the loop
+        // keeps ticking (instead of blocking on input) so it shows up.
+        let app = App::new(true);
+        if app.scramble.is_empty() {
+            assert!(app.tick_interval().is_some());
+        }
+        let mut app = app;
+        settle(&mut app);
+        assert!(app.tick_interval().is_none());
     }
 
     #[test]
@@ -774,7 +976,11 @@ mod tests {
         std::fs::write(&file, "x").unwrap();
         app.path = Some(file.join("sessions.json"));
         key(&mut app, KeyCode::Char('d'));
-        assert!(app.status.as_deref().is_some_and(|s| s.starts_with("save failed")));
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.starts_with("save failed"))
+        );
         key(&mut app, KeyCode::Char('o'));
         std::fs::remove_file(&file).unwrap();
     }
@@ -800,6 +1006,7 @@ mod tests {
         assert_eq!(app.view(at(done, 1_499)).tone, Tone::PbAlt);
         assert_eq!(app.view(at(done, 1_500)).tone, Tone::Idle);
         assert!(app.tick_interval().is_some());
+        settle(&mut app); // a pending scramble also keeps the loop ticking
         app.tick(at(done, 1_500));
         assert!(app.tick_interval().is_none());
     }
@@ -820,10 +1027,16 @@ mod tests {
     fn dnf_and_plus2_never_flash() {
         let t = Instant::now();
         let mut app = with_solves(&[10_000]);
-        app.state = State::Running { start: t, penalty: Penalty::Dnf };
+        app.state = State::Running {
+            start: t,
+            penalty: Penalty::Dnf,
+        };
         app.on_key(press(KeyCode::Char('x')), at(t, 5_000));
         assert_eq!(app.view(at(t, 5_000)).tone, Tone::Idle);
-        app.state = State::Running { start: t, penalty: Penalty::Plus2 };
+        app.state = State::Running {
+            start: t,
+            penalty: Penalty::Plus2,
+        };
         app.on_key(press(KeyCode::Char('x')), at(t, 9_000)); // 9 + 2 = 11 s, slower
         assert_eq!(app.view(at(t, 9_000)).tone, Tone::Idle);
     }
@@ -835,5 +1048,174 @@ mod tests {
         solve_at(&mut app, t, 5_000);
         app.on_key(press(KeyCode::Char('p')), at(t, 5_500));
         assert_eq!(app.view(at(t, 5_500)).tone, Tone::Idle);
+    }
+
+    #[test]
+    fn f_cycles_through_every_font_and_wraps() {
+        let mut app = App::new(true);
+        let start = app.font;
+        let mut seen = vec![start];
+        for _ in 0..font::choices() {
+            key(&mut app, KeyCode::Char('f'));
+            seen.push(app.font);
+        }
+        assert_eq!(*seen.last().unwrap(), start);
+        seen.pop();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), font::choices());
+        // shift-F goes back
+        key(&mut app, KeyCode::Char('F'));
+        assert_eq!(app.font, (start + font::choices() - 1) % font::choices());
+    }
+
+    #[test]
+    fn font_works_in_any_state_but_not_while_running() {
+        let t = Instant::now();
+        let mut app = App::new(true);
+        app.on_key(press(SPACE), t); // inspection
+        let before = app.font;
+        app.on_key(press(KeyCode::Char('f')), t);
+        assert_ne!(app.font, before);
+        app.state = State::Running {
+            start: t,
+            penalty: Penalty::Ok,
+        };
+        let before = app.font;
+        app.on_key(press(KeyCode::Char('f')), at(t, 100)); // stops the solve instead
+        assert_eq!(app.font, before);
+        assert_eq!(app.solves().len(), 1);
+    }
+
+    #[test]
+    fn settings_survive_a_restart() {
+        let dir =
+            std::env::temp_dir().join(format!("cubetimer-settings-test-{}", std::process::id()));
+        let path = dir.join("sessions.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut app = App::new(true).with_storage(path.clone(), store::load(&path));
+        assert_eq!(font::name_at(app.font), font::DEFAULT);
+        let target = font::index_of("pixel");
+        while app.font != target {
+            key(&mut app, KeyCode::Char('f'));
+        }
+        key(&mut app, KeyCode::Char('i')); // inspection off
+        key(&mut app, KeyCode::Char('b')); // bell on
+
+        let app = App::new(true).with_storage(path.clone(), store::load(&path));
+        assert_eq!(font::name_at(app.font), "pixel");
+        assert!(!app.inspection_on);
+        assert!(app.bell);
+    }
+
+    #[test]
+    fn an_unknown_saved_font_falls_back_to_the_default() {
+        let mut loaded = store::Loaded {
+            data: Data::default(),
+            warning: None,
+        };
+        loaded.data.settings.font = "from-a-newer-version".into();
+        let app = App::new(true).with_storage(PathBuf::from("/nonexistent/sessions.json"), loaded);
+        assert_eq!(font::name_at(app.font), font::DEFAULT);
+    }
+
+    #[test]
+    fn history_browses_marks_and_deletes_any_solve() {
+        let mut app = with_solves(&[1_000, 2_000, 3_000, 4_000]);
+        key(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.history, Some(3)); // newest first
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.history, Some(1));
+        key(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.solves()[1].penalty, Penalty::Dnf);
+        assert_eq!(app.solves()[3].penalty, Penalty::Ok);
+        key(&mut app, KeyCode::Char('+'));
+        assert_eq!(app.solves()[1].penalty, Penalty::Plus2);
+        // delete asks first, then removes exactly that solve
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.delete_prompt(), "delete solve 2? y / n");
+        key(&mut app, KeyCode::Char('y'));
+        let left: Vec<u64> = app.solves().iter().map(|s| s.ms).collect();
+        assert_eq!(left, vec![1_000, 3_000, 4_000]);
+        assert_eq!(app.history, Some(1));
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.history, None);
+    }
+
+    #[test]
+    fn history_selection_stays_in_range() {
+        let mut app = with_solves(&[1_000, 2_000, 3_000]);
+        key(&mut app, KeyCode::Char('h'));
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.history, Some(2));
+        key(&mut app, KeyCode::PageDown);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.history, Some(0));
+        key(&mut app, KeyCode::Home);
+        assert_eq!(app.history, Some(2));
+        key(&mut app, KeyCode::End);
+        assert_eq!(app.history, Some(0));
+    }
+
+    #[test]
+    fn deleting_the_only_solve_closes_history() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('h'));
+        key(&mut app, KeyCode::Delete);
+        key(&mut app, KeyCode::Char('y'));
+        assert!(app.solves().is_empty());
+        assert_eq!(app.history, None);
+    }
+
+    #[test]
+    fn history_keys_do_not_leak_to_the_timer() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('h'));
+        key(&mut app, SPACE);
+        key(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.state, State::Idle);
+        assert!(!app.quit);
+        assert_eq!(app.history, None); // q closed the browser, not the app
+    }
+
+    #[test]
+    fn history_needs_solves_and_an_idle_timer() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.history, None);
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, SPACE); // inspecting
+        key(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.history, None);
+    }
+
+    #[test]
+    fn help_opens_with_question_mark_and_any_key_closes_it() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('?'));
+        assert!(app.show_help);
+        key(&mut app, SPACE);
+        assert!(!app.show_help);
+        assert_eq!(app.state, State::Idle); // the closing key does nothing else
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_history_and_help() {
+        let ctrl_c = KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        );
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('h'));
+        app.on_key(ctrl_c, Instant::now());
+        assert!(app.quit);
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('?'));
+        app.on_key(ctrl_c, Instant::now());
+        assert!(app.quit);
     }
 }

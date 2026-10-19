@@ -3,7 +3,7 @@ name = "cubetimer"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Full-screen ASCII speedcube timer for the terminal, with WCA inspection and hold-to-start (kitty keyboard protocol)"
+description = "Full-screen speedcube timer for the terminal: WCA inspection, hold-to-start, random-state scrambles with preview"
 license = "MIT"
 repository = "https://github.com/thomasmartinoa/cubetimer"
 readme = "README.md"
@@ -16,8 +16,17 @@ rand = "0.10.3"
 ratatui = "0.30.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+signal-hook = "0.3.18"
 
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
+
+# The scramble solver's tables take seconds to build unoptimized; tests (and
+# makepkg's check()) are much faster with optimizations on.
+[profile.test]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1

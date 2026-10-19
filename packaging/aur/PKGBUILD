@@ -2,7 +2,7 @@
 pkgname=cubetimer
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Full-screen ASCII speedcube timer for the terminal, with WCA inspection and hold-to-start'
+pkgdesc='Full-screen speedcube timer for the terminal: WCA inspection, hold-to-start, random-state scrambles'
 arch=('x86_64' 'aarch64')
 url='https://github.com/thomasmartinoa/cubetimer'
 license=('MIT')

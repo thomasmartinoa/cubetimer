@@ -56,7 +56,6 @@ fn mean(results: &[TimeResult]) -> Option<TimeResult> {
 }
 
 /// Plain mean of the last `n` results (mo3 is `mo(results, 3)`).
-#[allow(dead_code)] // no mo3 display yet
 pub fn mo(results: &[TimeResult], n: usize) -> Option<TimeResult> {
     if n == 0 || results.len() < n {
         return None;
@@ -86,7 +85,9 @@ pub fn best_ao(results: &[TimeResult], n: usize) -> Option<TimeResult> {
     if n < 3 || results.len() < n {
         return None;
     }
-    (n..=results.len()).filter_map(|end| ao(&results[..end], n)).min()
+    (n..=results.len())
+        .filter_map(|end| ao(&results[..end], n))
+        .min()
 }
 
 /// Mean of the non-DNF solves, in ms (csTimer's session mean).
@@ -110,6 +111,7 @@ pub struct Summary {
     pub count: usize,
     pub best: Option<TimeResult>,
     pub mean: Option<u64>,
+    pub mo3: Option<TimeResult>,
     pub ao5: Option<TimeResult>,
     pub ao12: Option<TimeResult>,
     pub ao100: Option<TimeResult>,
@@ -122,6 +124,7 @@ pub fn summarize(results: &[TimeResult]) -> Summary {
         count: results.len(),
         best: best(results),
         mean: session_mean(results),
+        mo3: mo(results, 3),
         ao5: ao(results, 5),
         ao12: ao(results, 12),
         ao100: ao(results, 100),
@@ -170,7 +173,10 @@ mod tests {
 
     #[test]
     fn ao_uses_last_n_only() {
-        assert_eq!(ao(&ms(&[99_999, 1000, 2000, 3000, 4000, 5000]), 5), Some(Ms(3000)));
+        assert_eq!(
+            ao(&ms(&[99_999, 1000, 2000, 3000, 4000, 5000]), 5),
+            Some(Ms(3000))
+        );
     }
 
     #[test]
@@ -234,7 +240,9 @@ mod tests {
 
     #[test]
     fn best_ao_scans_all_windows() {
-        let r = ms(&[9000, 9000, 9000, 9000, 9000, 1000, 1000, 1000, 1000, 1000, 9000]);
+        let r = ms(&[
+            9000, 9000, 9000, 9000, 9000, 1000, 1000, 1000, 1000, 1000, 9000,
+        ]);
         assert_eq!(best_ao(&r, 5), Some(Ms(1000)));
         assert_eq!(best_ao(&r[..4], 5), None);
     }

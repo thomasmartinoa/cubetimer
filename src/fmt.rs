@@ -135,6 +135,39 @@ pub fn fmt_inspection(elapsed_ms: u64) -> String {
     }
 }
 
+/// How long ago a Unix timestamp was, relative to `now`: `just now`,
+/// `5 min ago`, `3 h ago`, `2 days ago`, then the date (UTC) for anything
+/// older than a month.
+pub fn fmt_ago(ts: u64, now: u64) -> String {
+    let secs = now.saturating_sub(ts);
+    match secs {
+        0..60 => "just now".into(),
+        60..3_600 => format!("{} min ago", secs / 60),
+        3_600..86_400 => format!("{} h ago", secs / 3_600),
+        86_400..172_800 => "yesterday".into(),
+        172_800..2_592_000 => format!("{} days ago", secs / 86_400),
+        _ => {
+            let (y, m, d) = civil_from_days((ts / 86_400) as i64);
+            format!("{y}-{m:02}-{d:02}")
+        }
+    }
+}
+
+/// Days since 1970-01-01 to a (year, month, day) date, after Howard Hinnant's
+/// `civil_from_days`.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +277,28 @@ mod tests {
         assert_eq!(fmt_inspection(15_000), "+2");
         assert_eq!(fmt_inspection(16_999), "+2");
         assert_eq!(fmt_inspection(17_000), "DNF");
+    }
+
+    #[test]
+    fn ago() {
+        let now = 1_800_000_000;
+        assert_eq!(fmt_ago(now, now), "just now");
+        assert_eq!(fmt_ago(now - 59, now), "just now");
+        assert_eq!(fmt_ago(now - 60, now), "1 min ago");
+        assert_eq!(fmt_ago(now - 3_599, now), "59 min ago");
+        assert_eq!(fmt_ago(now - 3_600, now), "1 h ago");
+        assert_eq!(fmt_ago(now - 86_400, now), "yesterday");
+        assert_eq!(fmt_ago(now - 3 * 86_400, now), "3 days ago");
+        // a timestamp from the future (clock change) isn't negative
+        assert_eq!(fmt_ago(now + 500, now), "just now");
+    }
+
+    #[test]
+    fn old_solves_show_their_date() {
+        let now = 1_800_000_000;
+        assert_eq!(fmt_ago(0, now), "1970-01-01");
+        assert_eq!(fmt_ago(951_782_400, now), "2000-02-29"); // leap day
+        assert_eq!(fmt_ago(1_709_164_800, now), "2024-02-29");
+        assert_eq!(fmt_ago(1_735_689_599, now), "2024-12-31");
     }
 }

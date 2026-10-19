@@ -1,7 +1,8 @@
 # cubetimer
 
 A full-screen speedcubing timer for your terminal. Big ASCII digits, the WCA 15-second
-inspection, hold-and-release start like a Stackmat, and live ao5 / ao12 / ao100 stats.
+inspection, hold-and-release start like a Stackmat, WCA-style random-state scrambles with a
+preview of the scrambled cube, and live ao5 / ao12 / ao100 stats.
 
 ![cubetimer, idle: scramble, big last time, stats and recent solves](docs/screenshots/idle.png)
 
@@ -19,19 +20,33 @@ whatever theme you already run.
 - **Honest time formatting.** Single solves are truncated to hundredths and averages are
   rounded, as in the WCA regulations and csTimer. 12.349 shows as `12.34`; a +2 shows as
   `14.34+`; a DNF in the list keeps its raw time, `DNF(12.34)`.
-- **Live stats.** Best, mean, ao5, ao12, ao100, best ao5 and best ao12. The average drops
-  the best and worst 5% (at least one each) and a DNF counts as the worst result.
-- **Scrambles.** A fresh 20-move scramble after every solve, with no repeated face and no
-  `R L R` runs.
+- **Random-state scrambles.** Made the way the WCA's official scrambler (TNoodle) makes
+  them: a uniformly random cube state, solved with the two-phase algorithm in at most 21
+  moves. See [Scrambles](#scrambles).
+- **Scramble preview.** A colored net of the scrambled cube, so you can check you
+  scrambled it right.
+- **Live stats.** Best, mean, mo3, ao5, ao12, ao100, best ao5 and best ao12. The average
+  drops the best and worst 5% (at least one each) and a DNF counts as the worst result.
+- **History.** Press `h` to browse every solve: its time, when it was done, its scramble
+  and cube. Mark any solve +2, DNF or OK, or delete it.
 - **Sessions.** Everything is saved after every change; start a new session and flip
   between them.
 - **Personal best flash.** Beat your best single and the time blinks.
-- **Fits any window.** Big colossal-style digits, a compact 3-row font when the terminal
-  is small, and a stripped-down layout below that.
+- **Digits sized to your window.** The default `auto` mode keeps the time at about half
+  of the available height: not huge, not tiny, at any window size. Press `f` to
+  pick a specific style instead, see [Digit fonts](#digit-fonts).
+- **Fits any window.** If the font you picked doesn't fit, the next smaller one is used,
+  and the layout shrinks to a few text lines in very small windows.
+- **Remembers your setup.** The font, inspection and bell settings are saved.
+- **Safe with your data.** Saves are atomic, a damaged file is set aside instead of
+  overwritten, only one copy can run at a time, and the terminal is restored however the
+  program ends (quit, crash, `kill`, closed window).
 
 | Inspection (8 s warning) | Ready to start | Running |
 |---|---|---|
 | ![inspection countdown with the 8s warning](docs/screenshots/inspection.png) | ![hold space until the digits turn green](docs/screenshots/ready.png) | ![the running timer](docs/screenshots/running.png) |
+
+![the history browser: solve list, the selected solve's details, scramble and cube](docs/screenshots/history.png)
 
 ## Install
 
@@ -68,19 +83,112 @@ kitty --start-as=fullscreen cubetimer
 | `Esc` | Cancel inspection or a hold |
 | `+` (or `=`) / `d` / `o` | Mark the last solve +2, DNF or OK |
 | `Backspace` | Delete the last solve (asks `y` / `n`) |
+| `h` | History: browse, mark and delete any solve |
 | `n` | New session (not while the current one is empty) |
 | `[` / `]` | Previous / next session |
 | `i` | Turn inspection on or off |
+| `f` / `F` | Next / previous digit font (`auto` first) |
 | `p` | Cycle the running display: `0.01`, whole seconds, hidden |
 | `b` | Turn the inspection bell on or off |
+| `?` | Show all keys |
 | `q` / `Ctrl-C` | Quit (`q` stops the timer if one is running; `Ctrl-C` always quits) |
 
-The mark, delete, session and `i` keys work only when the timer is idle.
+The mark, delete, history, session, `i` and `?` keys work only when the timer is idle.
+The font, `p` and bell keys work any time except while the clock is running, when any key
+stops it.
+
+In the history browser, `↑`/`↓` (or `k`/`j`), `PgUp`/`PgDn` and `Home`/`End` move, `+` `d`
+`o` mark the selected solve, `Backspace` deletes it (asks first) and `Esc` closes.
+
+`cubetimer --help` and `cubetimer --version` work as usual. Starting a second copy while
+one is running prints `already running` and exits, so two copies can't overwrite each
+other's solves.
 
 Solves are stored in `$XDG_DATA_HOME/cubetimer/sessions.json` (usually
 `~/.local/share/cubetimer/sessions.json`) and written atomically after every change. If
 the file can't be read it is moved aside to `sessions.json.corrupt` rather than
 overwritten, and a warning shows in the footer.
+
+## Digit fonts
+
+`f` cycles through `auto` and the fonts below, tallest first. Your choice is saved.
+`colossal`, `standard` and `mini` are ASCII art and work in any terminal. `pixel-xl`,
+`pixel` and `half` use Unicode block characters (`█ ▀ ▄`), which every common terminal
+font has. `plain` is ordinary text.
+
+`auto` picks from `colossal`, `standard` and `mini` (all ASCII), so it works everywhere.
+
+```
+pixel-xl (10 rows)
+    ████        ████████████            ████████████    ████    ████
+    ████        ████████████            ████████████    ████    ████
+████████                ████            ████            ████    ████
+████████                ████            ████            ████    ████
+    ████        ████████████            ████████████    ████████████
+    ████        ████████████            ████████████    ████████████
+    ████                ████                    ████            ████
+    ████                ████                    ████            ████
+████████████    ████████████    ████    ████████████            ████
+████████████    ████████████    ████    ████████████            ████
+
+colossal (8 rows)
+  d888     .d8888b.        888888888       d8888
+ d8888    d88P  Y88b       888            d8P888
+   888         .d88P       888           d8P 888
+   888        8888"        8888888b.    d8P  888
+   888         "Y8b.            "Y88b  d88   888
+   888    888    888              888  8888888888
+   888    Y88b  d88P  888  Y88b  d88P        888
+ 8888888   "Y8888P"   888   "Y8888P"         888
+
+standard (5 rows)
+ _   _____       ____    _  _
+/ | |___ /      | ___|  | || |
+| |   |_ \      |___ \  | || |_
+| |  ___) |  _   ___) | |__   _|
+|_| |____/  (_) |____/     |_|
+
+pixel (5 rows)
+  ██    ██████      ██████  ██  ██
+████        ██      ██      ██  ██
+  ██    ██████      ██████  ██████
+  ██        ██          ██      ██
+██████  ██████  ██  ██████      ██
+
+mini (3 rows)
+     _     _
+  |  _|   |_  |_|
+  |  _| .  _|   |
+
+half (3 rows)
+▄█  ▀▀█   █▀▀ █ █
+ █  ▀▀█   ▀▀█ ▀▀█
+▀▀▀ ▀▀▀ ▀ ▀▀▀   ▀
+
+plain (1 row)
+13.54
+```
+
+Run `cargo run --example fonts` to print them, or `cargo run --example fonts -- 1:02.34+`
+to try other text.
+
+## Scrambles
+
+WCA Regulation 4b3 asks for "a random state from all states that require at least 2 moves
+to solve". cubetimer follows the method of TNoodle, the WCA's official scramble program:
+
+1. pick a cube state uniformly at random from all 43 quintillion legal states;
+2. throw it away if it is solved or one move from solved;
+3. solve it with Kociemba's two-phase algorithm, in at most 21 moves;
+4. show the inverse of that solution as the scramble.
+
+So every state is equally likely, which random-move scrambles can't promise. Scrambles are
+usually 19 to 21 moves. The solver's tables take about 0.15 s to build when the program
+starts; the timer shows at once and the first scramble appears a moment later. After that
+the next scramble is prepared in the background while you solve.
+
+This is the same method, not the same program: for practice it is equivalent, but official
+competitions must use TNoodle itself (Regulation 4b).
 
 ## Other terminals
 
@@ -88,11 +196,17 @@ cubetimer needs key *release* events for hold-to-start, which come from the
 [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/). It checks
 for support at startup:
 
-- **Supported** (tested in kitty; other terminals that implement the protocol, such as
-  foot, Ghostty, WezTerm and recent Alacritty, should work but are untested): hold and
-  release to start.
+- **Supported**: hold and release to start.
 - **Not supported**: it falls back to **basic mode**. A space press starts the timer and
-  another stops it, and the footer says `basic mode`.
+  another stops it, and the footer says `basic mode`. (A terminal that never answers the
+  capability query makes startup wait about two seconds before falling back.)
+
+| Terminal | Status |
+|---|---|
+| kitty 0.49 | Tested: full mode, hold-to-start |
+| Alacritty 0.17 | Tested: full mode, hold-to-start, all fonts render |
+| A terminal with no keyboard protocol (checked on a bare pty) | Tested: basic mode works end to end |
+| foot, WezTerm, Ghostty, others with the protocol | Should work, untested |
 
 If hold-to-start doesn't behave, run the key tester and check that you see `Press`,
 `Repeat` and `Release` lines for space:
@@ -101,26 +215,31 @@ If hold-to-start doesn't behave, run the key tester and check that you see `Pres
 cargo run --example keytest
 ```
 
+(`KEYTEST_LOG=file` also writes the events to a file.)
+
 The first line should say `keyboard enhancement: ON`.
 
 ## Limitations
 
-- 3x3 only, with random-move scrambles (not the random-state scrambles used at WCA
-  competitions).
-- No graphs, Bluetooth smart cubes or other puzzles.
+- 3x3 only.
+- No graphs, Bluetooth smart cubes, csTimer import/export, or session names.
+- The scramble preview uses true color (24-bit), which every terminal listed above
+  supports.
 
 ## Development
 
 ```sh
-cargo test                 # 87 tests: formatting, stats, scrambles, state machine, layouts
-cargo clippy
+cargo test                 # cube model, solver, scrambles, formatting, stats, fonts, state machine, layouts
+cargo clippy --all-targets
 cargo run --example keytest
+cargo run --release --example scramblebench -- 2000   # solver speed and scramble lengths
 ```
 
-The code is small and split by job: `fmt.rs` (time formatting), `stats.rs` (averages),
-`font.rs` (digit fonts), `scramble.rs`, `store.rs` (sessions on disk), `app.rs` (state
-machine) and `ui.rs` (drawing). `term.rs` owns raw mode and the keyboard protocol, and
-restores the terminal on exit and on panic.
+The code is split by job: `cube.rs` (the cube at the piece level), `twophase.rs` (the
+solver), `scramble.rs`, `fmt.rs` (time formatting), `stats.rs` (averages), `font.rs`
+(digit fonts), `store.rs` (sessions on disk), `app.rs` (state machine) and `ui.rs`
+(drawing). `term.rs` owns raw mode and the keyboard protocol, and restores the terminal on
+exit, on panic and on signals.
 
 ## License
 

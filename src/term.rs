@@ -63,6 +63,22 @@ pub fn restore() {
     let _ = out.flush();
 }
 
+/// Restore the terminal and exit on SIGTERM, SIGHUP, SIGQUIT or SIGINT. These
+/// would otherwise end the process without running `Guard`'s `Drop`, leaving
+/// the terminal in raw mode on the alternate screen. Solves are already on
+/// disk (every change is saved atomically), so exiting here loses nothing.
+pub fn restore_on_signals() -> io::Result<()> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+    let mut signals = signal_hook::iterator::Signals::new([SIGTERM, SIGHUP, SIGQUIT, SIGINT])?;
+    std::thread::spawn(move || {
+        if let Some(signal) = signals.forever().next() {
+            restore();
+            std::process::exit(128 + signal);
+        }
+    });
+    Ok(())
+}
+
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
