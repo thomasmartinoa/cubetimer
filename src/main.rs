@@ -1,4 +1,5 @@
 mod app;
+mod chart;
 mod cube;
 mod fmt;
 mod font;
@@ -6,6 +7,7 @@ mod nxn;
 mod puzzle;
 mod scramble;
 mod stats;
+mod statsview;
 mod store;
 mod term;
 mod twobytwo;

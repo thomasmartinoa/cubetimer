@@ -10,11 +10,13 @@ use std::time::{Duration, Instant};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::chart::Range;
 use crate::fmt::{self, Precision, RunDisplay};
 use crate::font;
 use crate::puzzle::{self, Puzzle};
 use crate::scramble::Scrambler;
 use crate::stats::{self, Penalty, Summary, TimeResult};
+use crate::statsview::StatsView;
 use crate::store::{self, Data, Loaded, Session, Settings, Solve};
 use crate::ui;
 
@@ -100,6 +102,8 @@ pub struct App {
     pub history: Option<usize>,
     /// The key help overlay is open.
     pub show_help: bool,
+    /// The statistics screen, when open.
+    pub stats: Option<StatsView>,
     /// The puzzle picker is open with this puzzle highlighted.
     pub picker: Option<usize>,
     /// The full-screen scramble preview is open.
@@ -137,6 +141,7 @@ impl App {
             confirm_session_delete: false,
             show_help: false,
             picker: None,
+            stats: None,
             show_preview: false,
             down: None,
             pb_flash: None,
@@ -311,6 +316,17 @@ impl App {
             self.picker_key(code, selected);
             return;
         }
+        if let Some(view) = self.stats.as_mut() {
+            match code {
+                KeyCode::Char('r') => view.range = view.range.next(),
+                KeyCode::Char(c @ '1'..='4') => {
+                    view.range = Range::ALL[c.to_digit(10).unwrap_or(1) as usize - 1];
+                }
+                KeyCode::Esc | KeyCode::Char('s' | 'q') => self.stats = None,
+                _ => {}
+            }
+            return;
+        }
         if let Some(selected) = self.history {
             self.history_key(code, selected);
             return;
@@ -341,6 +357,7 @@ impl App {
                 );
             }
             KeyCode::Char('v') if idle => self.show_preview = true,
+            KeyCode::Char('s') if idle => self.stats = Some(StatsView::new(self)),
             KeyCode::Char('n') if idle => self.new_session(),
             KeyCode::Char('X') if idle => self.confirm_session_delete = true,
             KeyCode::Char('[') if idle => self.switch_session(-1),
@@ -1793,6 +1810,92 @@ mod tests {
         key(&mut app, SPACE);
         key(&mut app, KeyCode::Char('v'));
         assert!(!app.show_preview);
+    }
+
+    #[test]
+    fn s_opens_the_statistics_screen_and_keys_change_the_range() {
+        let mut app = with_solves(&[10_000, 11_000, 12_000]);
+        key(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.stats.as_ref().unwrap().range, Range::Last100);
+        key(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.stats.as_ref().unwrap().range, Range::Last500);
+        key(&mut app, KeyCode::Char('r'));
+        key(&mut app, KeyCode::Char('r'));
+        assert_eq!(
+            app.stats.as_ref().unwrap().range,
+            Range::Last50,
+            "wraps around"
+        );
+        for (digit, range) in [
+            ('1', Range::Last50),
+            ('2', Range::Last100),
+            ('3', Range::Last500),
+            ('4', Range::All),
+        ] {
+            key(&mut app, KeyCode::Char(digit));
+            assert_eq!(app.stats.as_ref().unwrap().range, range);
+        }
+        key(&mut app, KeyCode::Esc);
+        assert!(app.stats.is_none());
+        key(&mut app, KeyCode::Char('s'));
+        key(&mut app, KeyCode::Char('s'));
+        assert!(app.stats.is_none(), "s closes it too");
+        key(&mut app, KeyCode::Char('s'));
+        key(&mut app, KeyCode::Char('q'));
+        assert!(
+            app.stats.is_none() && !app.quit,
+            "q closes the screen, not the app"
+        );
+    }
+
+    #[test]
+    fn the_statistics_screen_is_a_snapshot_with_the_right_numbers() {
+        let mut app = with_solves(&[2_000, 4_000, 6_000, 8_000, 10_000]);
+        app.data.solves_mut()[1].penalty = Penalty::Plus2;
+        app.data.solves_mut()[2].penalty = Penalty::Dnf;
+        key(&mut app, KeyCode::Char('s'));
+        let view = app.stats.as_ref().unwrap();
+        assert_eq!((view.plus2, view.dnf), (1, 1));
+        assert_eq!(view.report.count, 5);
+        assert_eq!(view.report.finished, 4);
+    }
+
+    #[test]
+    fn statistics_keys_do_not_leak_to_the_timer() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('s'));
+        key(&mut app, SPACE);
+        key(&mut app, KeyCode::Char('d'));
+        key(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.state, State::Idle);
+        assert_eq!(app.solves()[0].penalty, Penalty::Ok);
+        assert!(app.history.is_none());
+        assert!(app.stats.is_some());
+    }
+
+    #[test]
+    fn statistics_open_only_when_idle_and_ctrl_c_still_quits() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, SPACE); // inspecting
+        key(&mut app, KeyCode::Char('s'));
+        assert!(app.stats.is_none());
+        let ctrl_c = KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        );
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('s'));
+        app.on_key(ctrl_c, Instant::now());
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn statistics_work_for_an_empty_session() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('s'));
+        let view = app.stats.as_ref().unwrap();
+        assert_eq!(view.report.count, 0);
     }
 }
 

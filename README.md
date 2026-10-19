@@ -30,8 +30,13 @@ already run.
   you scrambled it right; `v` shows it full screen.
 - **Live stats.** Best, mean, mo3, ao5, ao12, ao100, best ao5 and best ao12. The average
   drops the best and worst 5% (at least one each) and a DNF counts as the worst result.
+- **Statistics.** Press `s` for a full-screen view: a time chart with rolling ao5 and ao12,
+  every new personal best marked, DNFs and very slow solves flagged, round axis values, and
+  the chart can cover the last 50, 100, 500 or all solves. Beside it a histogram of your
+  times and a summary: solves with their +2 and DNF counts, best, worst, mean, standard
+  deviation, and current and best ao5, ao12, ao50, ao100 and ao1000.
 - **History.** Press `h` to browse every solve: its time, when it was done, its scramble
-  and cube, and a trend chart of the session with the rolling ao5. Mark any solve +2, DNF
+  and cube, and the same chart of the session with the solve marked. Mark any solve +2, DNF
   or OK, or delete it.
 - **Sessions.** Everything is saved after every change; start a new session, flip
   between them, or delete one.
@@ -52,7 +57,9 @@ already run.
 |---|---|---|
 | ![inspection countdown with the 8s warning](docs/screenshots/inspection.png) | ![hold space until the digits turn green](docs/screenshots/ready.png) | ![the running timer](docs/screenshots/running.png) |
 
-![the history browser: solve list, the selected solve's details, scramble and cube](docs/screenshots/history.png)
+![the statistics screen: time chart with ao5 and ao12, distribution and summary](docs/screenshots/stats.png)
+
+![the history browser: solve list, the selected solve's details, scramble and cube, and the chart](docs/screenshots/history.png)
 
 ## Install
 
@@ -90,6 +97,7 @@ kitty --start-as=fullscreen cubetimer
 | `+` (or `=`) / `d` / `o` | Mark the last solve +2, DNF or OK |
 | `Backspace` | Delete the last solve (asks `y` / `n`) |
 | `h` | History: browse, mark and delete any solve |
+| `s` | Statistics: chart, distribution and summary (`r` or `1`-`4` change the range, `Esc` closes) |
 | `e` | Choose the puzzle: 2x2, 3x3, 4x4, 5x5, 6x6 or 7x7 (`2`-`7` jump straight to one) |
 | `v` | Full-screen scramble preview (any key closes) |
 | `n` | New session of the current puzzle (not while the current one is empty) |
@@ -102,8 +110,8 @@ kitty --start-as=fullscreen cubetimer
 | `?` or `F1` | Show all keys (`/` works too) |
 | `q` / `Ctrl-C` | Quit (`q` stops the timer if one is running; `Ctrl-C` always quits) |
 
-The mark, delete, history, puzzle, preview, session, `i` and `?` keys work only when the
-timer is idle.
+The mark, delete, history, statistics, puzzle, preview, session, `i` and `?` keys work only
+when the timer is idle.
 The font, `p` and bell keys work any time except while the clock is running, when any key
 stops it.
 
@@ -273,8 +281,9 @@ cargo run --release --example scramblebench -- 2000   # solver speed and scrambl
 The code is split by job: `cube.rs` (the 3x3 at the piece level), `twophase.rs` (the 3x3
 solver), `nxn.rs` (cubes of any size as stickers in space), `twobytwo.rs` (the 2x2 state
 table), `puzzle.rs`, `scramble.rs`, `fmt.rs` (time formatting), `stats.rs` (averages), `font.rs`
-(digit fonts), `store.rs` (sessions on disk), `app.rs` (state machine) and `ui.rs`
-(drawing). `term.rs` owns raw mode and the keyboard protocol, and restores the terminal on
+(digit fonts), `store.rs` (sessions on disk), `app.rs` (state machine), `ui.rs`
+(drawing), `chart.rs` (axis ticks, outliers, histograms) and `statsview.rs` (the statistics
+screen and the chart). `term.rs` owns raw mode and the keyboard protocol, and restores the terminal on
 exit, on panic and on signals.
 
 ## License

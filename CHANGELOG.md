@@ -9,6 +9,11 @@
 - The scramble preview works at every size, and `v` shows it full screen.
 - Long scrambles (up to 100 moves) wrap across as many lines as they need.
 - `--export` has a puzzle column.
+- Statistics screen (`s`): a time chart with rolling ao5 and ao12, personal bests, DNFs and
+  slow solves marked, a range of the last 50, 100, 500 or all solves, a histogram and a
+  summary with standard deviation and ao50 and ao1000.
+- The chart is drawn so that axis labels and gridlines line up exactly, uses round axis
+  values, and a few terrible solves no longer flatten the rest. The history browser uses it.
 
 ## 0.1.0
 
