@@ -133,6 +133,45 @@ pub fn summarize(results: &[TimeResult]) -> Summary {
     }
 }
 
+/// The averages the statistics screen lists.
+pub const REPORT_AVERAGES: [usize; 5] = [5, 12, 50, 100, 1000];
+
+/// Everything on the statistics screen's summary, computed once.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Report {
+    pub count: usize,
+    pub finished: usize,
+    pub best: Option<TimeResult>,
+    /// The slowest finished solve.
+    pub worst: Option<u64>,
+    pub mean: Option<u64>,
+    pub std_dev_ms: Option<f64>,
+    /// `(n, current aoN, best aoN)` for each of `REPORT_AVERAGES`.
+    pub averages: Vec<(usize, Option<TimeResult>, Option<TimeResult>)>,
+}
+
+pub fn report(results: &[TimeResult]) -> Report {
+    let times: Vec<u64> = results
+        .iter()
+        .filter_map(|r| match r {
+            TimeResult::Ms(ms) => Some(*ms),
+            TimeResult::Dnf => None,
+        })
+        .collect();
+    Report {
+        count: results.len(),
+        finished: times.len(),
+        best: best(results),
+        worst: times.iter().copied().max(),
+        mean: session_mean(results),
+        std_dev_ms: crate::chart::std_dev(&times),
+        averages: REPORT_AVERAGES
+            .iter()
+            .map(|&n| (n, ao(results, n), best_ao(results, n)))
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +310,52 @@ mod tests {
         assert_eq!(serde_json::to_string(&Penalty::Ok).unwrap(), "\"ok\"");
         assert_eq!(serde_json::to_string(&Penalty::Plus2).unwrap(), "\"plus2\"");
         assert_eq!(serde_json::to_string(&Penalty::Dnf).unwrap(), "\"dnf\"");
+    }
+
+    #[test]
+    fn report_summarizes_a_session() {
+        let r = report(&[Ms(2000), Ms(4000), Dnf, Ms(6000), Ms(8000)]);
+        assert_eq!((r.count, r.finished), (5, 4));
+        assert_eq!(
+            (r.best, r.worst, r.mean),
+            (Some(Ms(2000)), Some(8000), Some(5000))
+        );
+        assert!((r.std_dev_ms.unwrap() - 2236.07).abs() < 0.01);
+        // 5 solves: ao5 exists (the DNF is the dropped worst), longer ones don't
+        let ao5 = r.averages.iter().find(|a| a.0 == 5).unwrap();
+        assert_eq!(ao5.1, Some(Ms(6000)));
+        assert!(
+            r.averages
+                .iter()
+                .filter(|a| a.0 > 5)
+                .all(|a| a.1.is_none() && a.2.is_none())
+        );
+        assert_eq!(r.averages.len(), REPORT_AVERAGES.len());
+    }
+
+    #[test]
+    fn report_of_nothing_and_of_all_dnfs() {
+        let none = report(&[]);
+        assert_eq!(
+            (none.count, none.finished, none.best, none.worst),
+            (0, 0, None, None)
+        );
+        assert!(none.mean.is_none() && none.std_dev_ms.is_none());
+        let dnfs = report(&[Dnf, Dnf]);
+        assert_eq!((dnfs.count, dnfs.finished, dnfs.best), (2, 0, Some(Dnf)));
+        assert_eq!(dnfs.worst, None);
+    }
+
+    #[test]
+    fn report_handles_a_big_session_quickly() {
+        let results: Vec<TimeResult> = (0..5000).map(|i| Ms(10_000 + (i * 7919) % 4000)).collect();
+        let start = std::time::Instant::now();
+        let r = report(&results);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(r.averages.iter().all(|a| a.1.is_some() && a.2.is_some()));
     }
 }

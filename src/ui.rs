@@ -5,17 +5,15 @@ use std::time::Instant;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Axis, Block, Chart, Clear, Dataset, GraphType, LegendPosition, Padding, Paragraph, Wrap,
-};
+use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 
 use crate::app::{App, Tone};
 use crate::fmt;
 use crate::font;
 use crate::nxn;
-use crate::stats::{self, Penalty, TimeResult};
+use crate::stats::{Penalty, TimeResult};
+use crate::statsview;
 
 fn tone_color(tone: Tone) -> Color {
     match tone {
@@ -37,6 +35,10 @@ const COMPACT_MIN_HEIGHT: u16 = 8;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    if let Some(view) = &app.stats {
+        statsview::draw(frame, area, app, view);
+        return;
+    }
     if area.width >= FULL_MIN.0 && area.height >= FULL_MIN.1 {
         // As many lines as the scramble needs once wrapped (100 moves on 7x7).
         let scramble_lines = wrapped_lines(&app.scramble, (area.width as usize).saturating_sub(4));
@@ -525,11 +527,12 @@ fn draw_stats_line(frame: &mut Frame, area: Rect, app: &App) {
 fn footer_text(app: &App, width: usize) -> String {
     let on = |b: bool| if b { "on" } else { "off" };
     // (priority: lower stays longer, text), in display order
-    let parts: [(u8, String); 12] = [
+    let parts: [(u8, String); 13] = [
         (1, "space go".into()),
         (6, "+/d/o mark".into()),
         (8, "bksp delete".into()),
         (7, "h history".into()),
+        (7, "s stats".into()),
         (9, "n [ ] session".into()),
         (5, format!("i inspect:{}", on(app.inspection_on))),
         (4, format!("f font:{}", font::name_at(app.font))),
@@ -541,7 +544,7 @@ fn footer_text(app: &App, width: usize) -> String {
     ];
     let mut order: Vec<usize> = (0..parts.len()).collect();
     order.sort_by_key(|&i| parts[i].0);
-    let mut keep = [false; 12];
+    let mut keep = [false; 13];
     let mut used = 1;
     for i in order {
         let need = parts[i].1.chars().count() + 2;
@@ -577,13 +580,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Every key, for the `?` overlay.
-const HELP: [(&str, &str); 20] = [
+const HELP: [(&str, &str); 22] = [
     ("space", "inspect, hold and release to start, stop"),
     ("any key", "stop a running solve"),
     ("esc", "cancel inspection or a hold"),
     ("+ / d / o", "mark the last solve +2, DNF or OK"),
     ("backspace", "delete the last solve (asks y / n)"),
     ("h", "history: browse, mark and delete any solve"),
+    ("s", "statistics: chart, distribution, summary"),
     ("e", "choose the puzzle: 2x2 to 7x7"),
     ("v", "full-screen scramble preview"),
     ("n", "new session"),
@@ -596,6 +600,7 @@ const HELP: [(&str, &str); 20] = [
     ("? / F1", "this help"),
     ("q / ctrl-c", "quit"),
     ("", ""),
+    ("in stats", "r or 1-4 change the range, esc closes"),
     ("in history", "up/down j/k pgup/pgdn home/end move"),
     ("", "+ / d / o mark, bksp delete, esc close"),
 ];
@@ -742,97 +747,18 @@ fn draw_history(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
     frame.render_widget(Paragraph::new(keys).style(dim()), help);
 }
 
-/// Every solve of the session as a line (DNFs left out), the rolling ao5 over
-/// it, and the selected solve marked.
+/// The session's solves as a chart with the selected one marked (see
+/// `statsview::draw_chart`).
 fn draw_trend(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
-    let results = app.results();
-    let secs = |ms: u64| ms as f64 / 1000.0;
-    let times: Vec<(f64, f64)> = results
-        .iter()
-        .enumerate()
-        .filter_map(|(i, r)| match r {
-            TimeResult::Ms(ms) => Some(((i + 1) as f64, secs(*ms))),
-            TimeResult::Dnf => None,
-        })
-        .collect();
-    let block = Block::bordered().title(" trend ").border_style(dim());
-    if times.len() < 2 {
-        frame.render_widget(
-            Paragraph::new("a trend needs two finished solves")
-                .style(dim())
-                .block(block),
-            area,
-        );
-        return;
-    }
-    let ao5: Vec<(f64, f64)> = (5..=results.len())
-        .filter_map(|end| match stats::ao(&results[..end], 5) {
-            Some(TimeResult::Ms(ms)) => Some((end as f64, secs(ms))),
-            _ => None,
-        })
-        .collect();
-    let mark: Vec<(f64, f64)> = times
-        .iter()
-        .copied()
-        .filter(|&(x, _)| x == (selected + 1) as f64)
-        .collect();
-
-    let (lo, hi) = times
-        .iter()
-        .fold((f64::MAX, f64::MIN), |(lo, hi), &(_, y)| {
-            (lo.min(y), hi.max(y))
-        });
-    let pad = ((hi - lo) * 0.1).max(0.05);
-    let (lo, hi) = ((lo - pad).max(0.0), hi + pad);
-    let prec = app.precision;
-    let label = |v: f64| Span::styled(fmt::fmt_time((v * 1000.0) as u64, prec), dim());
-    let n = results.len() as f64;
-
-    let mut datasets = vec![
-        Dataset::default()
-            .name("time")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .data(&times),
-    ];
-    if !ao5.is_empty() {
-        datasets.push(
-            Dataset::default()
-                .name("ao5")
-                .marker(Marker::Braille)
-                .graph_type(GraphType::Line)
-                .style(Style::new().fg(Color::Cyan))
-                .data(&ao5),
-        );
-    }
-    datasets.push(
-        Dataset::default()
-            .marker(Marker::Block)
-            .graph_type(GraphType::Scatter)
-            .style(Style::new().fg(Color::Yellow))
-            .data(&mark),
+    statsview::draw_chart(
+        frame,
+        area,
+        &app.results(),
+        0,
+        Some(selected),
+        app.precision,
+        "trend",
     );
-    let chart = Chart::new(datasets)
-        .block(block)
-        .x_axis(
-            Axis::default()
-                .bounds([1.0, n.max(2.0)])
-                .labels([
-                    Span::styled("1", dim()),
-                    Span::styled(format!("{}", results.len()), dim()),
-                ])
-                .style(dim()),
-        )
-        .y_axis(
-            Axis::default()
-                .bounds([lo, hi])
-                .labels([label(lo), label(hi)])
-                .style(dim()),
-        )
-        .legend_position(Some(LegendPosition::TopRight))
-        // the default hides the legend in charts this short
-        .hidden_legend_constraints((Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)));
-    frame.render_widget(chart, area);
 }
 
 /// +2 in yellow, DNF in red, the session best in bold green.
@@ -850,7 +776,9 @@ fn penalty_style(solve: &crate::store::Solve, best: Option<TimeResult>) -> Style
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chart::Range;
     use crate::stats::Penalty;
+    use crate::statsview::StatsView;
     use crate::store::Solve;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1294,10 +1222,10 @@ mod tests {
         assert!(out.contains("trend"));
         // the legend, checked on the chart alone at the short height a
         // fullscreen 1600x900 terminal gives it (other panels say "ao5" too)
-        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         terminal.draw(|f| draw_trend(f, f.area(), &app, 3)).unwrap();
         let buf = terminal.backend().buffer().clone();
-        let chart: String = (0..12u16)
+        let chart: String = (0..20u16)
             .map(|y| (0..60u16).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
             .collect();
         assert!(chart.contains("ao5") && chart.contains("time"), "{chart}");
@@ -1317,7 +1245,7 @@ mod tests {
             .solves_mut()
             .push(Solve::new(11_000, Penalty::Dnf, String::new()));
         app.history = Some(0);
-        assert!(render(&app, 140, 44).contains("a trend needs two finished solves"));
+        assert!(render(&app, 140, 44).contains("a chart needs two finished solves"));
     }
 
     #[test]
@@ -1466,5 +1394,205 @@ mod tests {
         assert!(out.contains("stats - 7x7"));
         render(&app, 80, 24);
         render(&app, 60, 20);
+    }
+
+    fn busy_app(n: usize) -> App {
+        let mut app = App::new(true);
+        for i in 0..n {
+            // a wobble around 13 s, a drift, the odd +2 and DNF and a huge outlier
+            let ms = 13_000 + ((i * 7919) % 1800) as u64 + (i as u64 * 3) % 400;
+            let penalty = match i % 40 {
+                7 => Penalty::Plus2,
+                23 => Penalty::Dnf,
+                _ => Penalty::Ok,
+            };
+            let ms = if i == n / 2 { 95_000 } else { ms };
+            app.data
+                .solves_mut()
+                .push(Solve::new(ms, penalty, String::new()));
+        }
+        app
+    }
+
+    #[test]
+    fn the_statistics_screen_shows_chart_distribution_and_summary() {
+        let mut app = busy_app(300);
+        app.stats = Some(StatsView::new(&app));
+        let out = render(&app, 140, 44);
+        for want in [
+            "statistics - 3x3",
+            "last 50",
+            "last 100",
+            "last 500",
+            "all",
+            "distribution",
+            "summary",
+            "solves",
+            "std dev",
+            "ao1000",
+            "current",
+            "esc close",
+        ] {
+            assert!(out.contains(want), "missing {want:?}");
+        }
+        assert!(out.contains("300"), "the solve count");
+        // the 95 s outlier didn't stretch the axis: the top label is nowhere near it
+        assert!(!out.contains("95.00") && !out.contains("90.00"), "{out}");
+        // y labels are round numbers
+        assert!(out.contains("13.00") || out.contains("14.00"));
+        assert!(!out.contains("it's the timer"), "the timer is replaced");
+    }
+
+    #[test]
+    fn the_range_selector_changes_what_is_drawn() {
+        let mut app = busy_app(300);
+        let mut view = StatsView::new(&app);
+        view.range = Range::Last50;
+        app.stats = Some(view);
+        let out = render(&app, 140, 44);
+        // the x axis starts at solve 251 when showing the last 50
+        assert!(out.contains("251"), "{out}");
+    }
+
+    #[test]
+    fn the_statistics_screen_survives_every_kind_of_data_and_size() {
+        let mut datasets: Vec<App> = vec![App::new(true), busy_app(1), busy_app(2), busy_app(2000)];
+        let mut dnfs = App::new(true);
+        for _ in 0..5 {
+            dnfs.data
+                .solves_mut()
+                .push(Solve::new(1_000, Penalty::Dnf, String::new()));
+        }
+        datasets.push(dnfs);
+        let mut same = App::new(true);
+        for _ in 0..30 {
+            same.data
+                .solves_mut()
+                .push(Solve::new(10_000, Penalty::Ok, String::new()));
+        }
+        datasets.push(same);
+        for mut app in datasets {
+            for range in Range::ALL {
+                let mut view = StatsView::new(&app);
+                view.range = range;
+                app.stats = Some(view);
+                for (w, h) in [
+                    (1, 1),
+                    (10, 3),
+                    (40, 10),
+                    (80, 24),
+                    (89, 29),
+                    (90, 31),
+                    (200, 60),
+                ] {
+                    render(&app, w, h);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn small_windows_drop_the_histogram_then_the_summary() {
+        let mut app = busy_app(100);
+        app.stats = Some(StatsView::new(&app));
+        let big = render(&app, 140, 44);
+        assert!(big.contains("distribution") && big.contains("summary"));
+        // a normal 24-row terminal has room for the distribution; 20 rows doesn't
+        assert!(render(&app, 140, 26).contains("distribution"));
+        let short = render(&app, 140, 20);
+        assert!(!short.contains("distribution") && short.contains("summary"));
+        let narrow = render(&app, 80, 44);
+        assert!(!narrow.contains("summary") && narrow.contains("distribution"));
+    }
+
+    #[test]
+    fn nothing_to_plot_says_so() {
+        let mut app = App::new(true);
+        app.stats = Some(StatsView::new(&app));
+        assert!(render(&app, 120, 40).contains("nothing to plot until a solve is finished"));
+    }
+
+    #[test]
+    fn the_chart_marks_the_selected_solve_and_slow_ones() {
+        let mut app = busy_app(60);
+        app.history = Some(10);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| draw_trend(f, f.area(), &app, 10))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let colors: Vec<_> = (0..30u16)
+            .flat_map(|y| (0..100u16).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf[(x, y)].style().fg)
+            .collect();
+        assert!(colors.contains(&Color::White), "selected solve");
+        assert!(
+            colors.contains(&Color::Yellow),
+            "the 95 s outlier at the top edge"
+        );
+        assert!(colors.contains(&Color::Cyan), "ao5");
+        assert!(colors.contains(&Color::LightMagenta), "ao12");
+        assert!(colors.contains(&Color::Red), "a DNF along the bottom");
+    }
+
+    #[test]
+    fn the_legend_drops_entries_that_do_not_fit_instead_of_cutting_them() {
+        let app = busy_app(80);
+        for width in [30u16, 40, 50, 70, 100] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+            terminal.draw(|f| draw_trend(f, f.area(), &app, 5)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let bottom: String = (0..width).map(|x| buf[(x, 15)].symbol()).collect();
+            // every legend word that appears is complete
+            for word in ["tim", "ao", "bes", "slowe", "DN"] {
+                for (at, _) in bottom.match_indices(word) {
+                    let rest = &bottom[at..];
+                    let full = ["time", "ao5", "ao12", "best", "slower", "DNF"]
+                        .iter()
+                        .any(|w| rest.starts_with(w));
+                    assert!(full, "{width}: cut-off legend in {bottom:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn axis_labels_sit_on_the_same_row_as_their_gridlines() {
+        // flat-ish data with a known round range: 10 s .. 20 s
+        let mut app = App::new(true);
+        for ms in [10_000u64, 20_000, 10_500, 19_500, 12_000, 18_000] {
+            app.data
+                .solves_mut()
+                .push(Solve::new(ms, Penalty::Ok, String::new()));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|f| draw_trend(f, f.area(), &app, 0)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let grid = Color::Indexed(238);
+        let mut checked = 0;
+        for y in 0..24u16 {
+            let row: String = (0..60u16).map(|x| buf[(x, y)].symbol()).collect();
+            // a label like "15.00" starting the row after the border
+            let trimmed = row.trim_start_matches('\u{2502}');
+            let Some(label) = trimmed
+                .split_whitespace()
+                .next()
+                .filter(|l| l.contains('.') && l.parse::<f64>().is_ok())
+            else {
+                continue;
+            };
+            let value: f64 = label.parse().unwrap();
+            if value <= 10.0 || value >= 20.0 {
+                continue; // the edges have no gridline
+            }
+            // the gridline for this value is drawn in this row (not the one above or below)
+            let has_line = (0..60u16).any(|x| buf[(x, y)].style().fg == Some(grid));
+            assert!(
+                has_line,
+                "no gridline beside the {label} label (row {y}):\n{row}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 1, "no interior labels found");
     }
 }
