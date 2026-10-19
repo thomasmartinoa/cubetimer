@@ -1,9 +1,11 @@
 name: CI
 
+# main: releases. dev: integration. feat/*: one branch per feature.
 on:
   push:
-    branches: [main]
+    branches: [main, dev, "feat/**"]
   pull_request:
+    branches: [main, dev]
 
 jobs:
   test:
@@ -16,6 +18,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: End-to-end checks on a pseudo-terminal
+        run: python3 scripts/pty_check.py target/release/cubetimer
 
   # Cargo.toml promises rust-version = "1.89"; keep that honest.
   msrv:
