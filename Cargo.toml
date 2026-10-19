@@ -1,0 +1,23 @@
+[package]
+name = "cubetimer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Full-screen ASCII speedcube timer for the terminal, with WCA inspection and hold-to-start (kitty keyboard protocol)"
+license = "MIT"
+repository = "https://github.com/thomasmartinoa/cubetimer"
+readme = "README.md"
+keywords = ["speedcubing", "rubiks-cube", "timer", "tui", "terminal"]
+categories = ["command-line-utilities", "games"]
+
+[dependencies]
+dirs = "7.0.0"
+rand = "0.10.3"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
