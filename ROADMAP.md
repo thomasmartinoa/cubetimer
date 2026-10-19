@@ -44,7 +44,7 @@ five terminals, and the scramble preview. It is behind on puzzle choice and stat
 None of the timers above has a 3D cube or a CFOP algorithm trainer, so those would make
 cubetimer stand out.
 
-## Phase 1: more cubes (2x2, 4x4 to 7x7) — `feat/puzzles`
+## Phase 1: more cubes (2x2, 4x4 to 7x7) — `feat/puzzles` — done (merged into dev)
 
 **Goal:** time any cube from 2x2 to 7x7, each with its own sessions and the scramble type
 the WCA uses for it.
@@ -100,7 +100,7 @@ moves on one axis so no sequence cancels or commutes into a shorter one.
 **Done when:** all six cubes can be timed with correct scrambles and previews, old data
 loads, and the merge checklist passes. Suggested model: Sonnet (clear spec).
 
-## Phase 2: statistics screen and better graphs — `feat/stats`
+## Phase 2: statistics screen and better graphs — `feat/stats` — done (merged into dev)
 
 **Goal:** a proper statistics view; the current trend chart is small, spiky and hard to
 read.
