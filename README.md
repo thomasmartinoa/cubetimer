@@ -28,9 +28,12 @@ whatever theme you already run.
 - **Live stats.** Best, mean, mo3, ao5, ao12, ao100, best ao5 and best ao12. The average
   drops the best and worst 5% (at least one each) and a DNF counts as the worst result.
 - **History.** Press `h` to browse every solve: its time, when it was done, its scramble
-  and cube. Mark any solve +2, DNF or OK, or delete it.
-- **Sessions.** Everything is saved after every change; start a new session and flip
-  between them.
+  and cube, and a trend chart of the session with the rolling ao5. Mark any solve +2, DNF
+  or OK, or delete it.
+- **Sessions.** Everything is saved after every change; start a new session, flip
+  between them, or delete one.
+- **Your data is yours.** `cubetimer --export` prints every solve as CSV for a
+  spreadsheet or another timer.
 - **Personal best flash.** Beat your best single and the time blinks.
 - **Digits sized to your window.** The default `auto` mode keeps the time at about half
   of the available height: not huge, not tiny, at any window size. Press `f` to
@@ -86,11 +89,12 @@ kitty --start-as=fullscreen cubetimer
 | `h` | History: browse, mark and delete any solve |
 | `n` | New session (not while the current one is empty) |
 | `[` / `]` | Previous / next session |
+| `X` | Delete the current session and its solves (asks `y` / `n`) |
 | `i` | Turn inspection on or off |
 | `f` / `F` | Next / previous digit font (`auto` first) |
 | `p` | Cycle the running display: `0.01`, whole seconds, hidden |
 | `b` | Turn the inspection bell on or off |
-| `?` | Show all keys |
+| `?` or `F1` | Show all keys |
 | `q` / `Ctrl-C` | Quit (`q` stops the timer if one is running; `Ctrl-C` always quits) |
 
 The mark, delete, history, session, `i` and `?` keys work only when the timer is idle.
@@ -100,7 +104,8 @@ stops it.
 In the history browser, `↑`/`↓` (or `k`/`j`), `PgUp`/`PgDn` and `Home`/`End` move, `+` `d`
 `o` mark the selected solve, `Backspace` deletes it (asks first) and `Esc` closes.
 
-`cubetimer --help` and `cubetimer --version` work as usual. Starting a second copy while
+`cubetimer --help` and `cubetimer --version` work as usual. `cubetimer --export > solves.csv`
+saves every solve (session, number, time, penalty, result, scramble, UTC date) as CSV. Starting a second copy while
 one is running prints `already running` and exits, so two copies can't overwrite each
 other's solves.
 
@@ -203,10 +208,18 @@ for support at startup:
 
 | Terminal | Status |
 |---|---|
-| kitty 0.49 | Tested: full mode, hold-to-start |
-| Alacritty 0.17 | Tested: full mode, hold-to-start, all fonts render |
-| A terminal with no keyboard protocol (checked on a bare pty) | Tested: basic mode works end to end |
-| foot, WezTerm, Ghostty, others with the protocol | Should work, untested |
+| kitty 0.49 | Tested: hold-to-start |
+| foot 1.28 | Tested: hold-to-start |
+| Alacritty 0.17 | Tested: hold-to-start |
+| Ghostty 1.3 | Tested: hold-to-start |
+| WezTerm | Tested: basic mode by default. For hold-to-start add `config.enable_kitty_keyboard = true` to `wezterm.lua` |
+| Any terminal without the protocol | Tested on a bare pty: basic mode works end to end |
+
+Each was checked end to end with the same physical key sequence: inspection,
+hold-and-release start, stopping while holding the key, Shift+`=` for +2 and Shift+`/`
+for help. Terminals disagree on some details (Ghostty and WezTerm send a held key's
+auto-repeat as new presses; WezTerm leaves out Shift on shifted keys), and cubetimer
+handles each of them.
 
 If hold-to-start doesn't behave, run the key tester and check that you see `Press`,
 `Repeat` and `Release` lines for space:

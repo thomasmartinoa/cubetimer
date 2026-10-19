@@ -6,7 +6,7 @@ pkgdesc='Full-screen speedcube timer for the terminal: WCA inspection, hold-to-s
 arch=('x86_64' 'aarch64')
 url='https://github.com/thomasmartinoa/cubetimer'
 license=('MIT')
-depends=('gcc-libs')
+depends=('glibc' 'libgcc')
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 # Fill in after tagging the release:  updpkgsums

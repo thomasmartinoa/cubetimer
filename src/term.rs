@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ratatui::crossterm::{
     cursor::Show,
-    event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
+    event::{
+        DisableFocusChange, EnableFocusChange, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -31,7 +34,8 @@ pub fn enter() -> io::Result<Guard> {
     install_panic_hook();
     enable_raw_mode()?;
     let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen)?;
+    // Focus events let the app forget a key that was let go in another window.
+    execute!(out, EnterAlternateScreen, EnableFocusChange)?;
     ACTIVE.store(true, Ordering::SeqCst);
 
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
@@ -56,7 +60,7 @@ pub fn restore() {
         let _ = execute!(out, PopKeyboardEnhancementFlags);
     }
     if ACTIVE.swap(false, Ordering::SeqCst) {
-        let _ = execute!(out, LeaveAlternateScreen);
+        let _ = execute!(out, DisableFocusChange, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
     let _ = execute!(out, Show);

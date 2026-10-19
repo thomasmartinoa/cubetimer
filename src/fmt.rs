@@ -153,6 +153,18 @@ pub fn fmt_ago(ts: u64, now: u64) -> String {
     }
 }
 
+/// A Unix timestamp as an ISO 8601 UTC date and time, `2026-10-19T17:05:09Z`.
+pub fn fmt_iso(ts: u64) -> String {
+    let (y, m, d) = civil_from_days((ts / 86_400) as i64);
+    let secs = ts % 86_400;
+    format!(
+        "{y}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3_600,
+        secs % 3_600 / 60,
+        secs % 60
+    )
+}
+
 /// Days since 1970-01-01 to a (year, month, day) date, after Howard Hinnant's
 /// `civil_from_days`.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
@@ -291,6 +303,13 @@ mod tests {
         assert_eq!(fmt_ago(now - 3 * 86_400, now), "3 days ago");
         // a timestamp from the future (clock change) isn't negative
         assert_eq!(fmt_ago(now + 500, now), "just now");
+    }
+
+    #[test]
+    fn iso_timestamps() {
+        assert_eq!(fmt_iso(0), "1970-01-01T00:00:00Z");
+        assert_eq!(fmt_iso(951_782_400 + 3_661), "2000-02-29T01:01:01Z");
+        assert_eq!(fmt_iso(1_735_689_599), "2024-12-31T23:59:59Z");
     }
 
     #[test]

@@ -5,14 +5,17 @@ use std::time::Instant;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Axis, Block, Chart, Clear, Dataset, GraphType, LegendPosition, Padding, Paragraph, Wrap,
+};
 
 use crate::app::{App, Tone};
 use crate::cube;
 use crate::fmt;
 use crate::font;
-use crate::stats::Penalty;
+use crate::stats::{self, Penalty, TimeResult};
 
 fn tone_color(tone: Tone) -> Color {
     match tone {
@@ -413,7 +416,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Every key, for the `?` overlay.
-const HELP: [(&str, &str); 17] = [
+const HELP: [(&str, &str); 18] = [
     ("space", "inspect, hold and release to start, stop"),
     ("any key", "stop a running solve"),
     ("esc", "cancel inspection or a hold"),
@@ -422,11 +425,12 @@ const HELP: [(&str, &str); 17] = [
     ("h", "history: browse, mark and delete any solve"),
     ("n", "new session"),
     ("[ / ]", "previous / next session"),
+    ("X", "delete the whole session (asks y / n)"),
     ("i", "inspection on / off"),
     ("f / F", "next / previous digit font"),
     ("p", "running display: 0.01, seconds, hidden"),
     ("b", "inspection bell on / off"),
-    ("?", "this help"),
+    ("? / F1", "this help"),
     ("q / ctrl-c", "quit"),
     ("", ""),
     ("in history", "up/down j/k pgup/pgdn home/end move"),
@@ -555,22 +559,121 @@ fn draw_history(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
         )));
     }
     let keys = "up/down move   + d o mark   bksp delete   esc close";
-    let [text, preview, help] = Layout::vertical([
-        Constraint::Min(0),
-        Constraint::Length(8),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
+    let [content, help] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    // The trend chart gets the right-hand side when there is room for it.
+    let [info, chart] = if content.width >= 80 {
+        Layout::horizontal([Constraint::Length(46), Constraint::Min(0)]).areas(content)
+    } else {
+        [content, Rect::default()]
+    };
+    let [text, preview] = Layout::vertical([Constraint::Min(0), Constraint::Length(8)]).areas(info);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text);
     if !solve.scramble.is_empty() && preview.width >= PREVIEW_WIDTH {
         let [p] = Layout::horizontal([Constraint::Length(PREVIEW_WIDTH)]).areas(preview);
         draw_preview(frame, p, &solve.scramble, "state");
     }
+    if chart.width > 0 {
+        draw_trend(frame, chart, app, selected);
+    }
     frame.render_widget(Paragraph::new(keys).style(dim()), help);
 }
 
+/// Every solve of the session as a line (DNFs left out), the rolling ao5 over
+/// it, and the selected solve marked.
+fn draw_trend(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
+    let results = app.results();
+    let secs = |ms: u64| ms as f64 / 1000.0;
+    let times: Vec<(f64, f64)> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| match r {
+            TimeResult::Ms(ms) => Some(((i + 1) as f64, secs(*ms))),
+            TimeResult::Dnf => None,
+        })
+        .collect();
+    let block = Block::bordered().title(" trend ").border_style(dim());
+    if times.len() < 2 {
+        frame.render_widget(
+            Paragraph::new("a trend needs two finished solves")
+                .style(dim())
+                .block(block),
+            area,
+        );
+        return;
+    }
+    let ao5: Vec<(f64, f64)> = (5..=results.len())
+        .filter_map(|end| match stats::ao(&results[..end], 5) {
+            Some(TimeResult::Ms(ms)) => Some((end as f64, secs(ms))),
+            _ => None,
+        })
+        .collect();
+    let mark: Vec<(f64, f64)> = times
+        .iter()
+        .copied()
+        .filter(|&(x, _)| x == (selected + 1) as f64)
+        .collect();
+
+    let (lo, hi) = times
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(lo, hi), &(_, y)| {
+            (lo.min(y), hi.max(y))
+        });
+    let pad = ((hi - lo) * 0.1).max(0.05);
+    let (lo, hi) = ((lo - pad).max(0.0), hi + pad);
+    let prec = app.precision;
+    let label = |v: f64| Span::styled(fmt::fmt_time((v * 1000.0) as u64, prec), dim());
+    let n = results.len() as f64;
+
+    let mut datasets = vec![
+        Dataset::default()
+            .name("time")
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .data(&times),
+    ];
+    if !ao5.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .name("ao5")
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::new().fg(Color::Cyan))
+                .data(&ao5),
+        );
+    }
+    datasets.push(
+        Dataset::default()
+            .marker(Marker::Block)
+            .graph_type(GraphType::Scatter)
+            .style(Style::new().fg(Color::Yellow))
+            .data(&mark),
+    );
+    let chart = Chart::new(datasets)
+        .block(block)
+        .x_axis(
+            Axis::default()
+                .bounds([1.0, n.max(2.0)])
+                .labels([
+                    Span::styled("1", dim()),
+                    Span::styled(format!("{}", results.len()), dim()),
+                ])
+                .style(dim()),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds([lo, hi])
+                .labels([label(lo), label(hi)])
+                .style(dim()),
+        )
+        .legend_position(Some(LegendPosition::TopRight))
+        // the default hides the legend in charts this short
+        .hidden_legend_constraints((Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)));
+    frame.render_widget(chart, area);
+}
+
 /// +2 in yellow, DNF in red, the session best in bold green.
-fn penalty_style(solve: &crate::store::Solve, best: Option<crate::stats::TimeResult>) -> Style {
+fn penalty_style(solve: &crate::store::Solve, best: Option<TimeResult>) -> Style {
     match solve.penalty {
         Penalty::Dnf => Style::new().fg(Color::Red),
         Penalty::Plus2 => Style::new().fg(Color::Yellow),
@@ -1012,5 +1115,62 @@ mod tests {
         // no preview net for a missing scramble
         assert!(!out.contains('\u{2580}'));
         assert!(render(&app, 50, 12).contains("generating scramble..."));
+    }
+
+    #[test]
+    fn history_draws_a_trend_chart_with_ao5() {
+        let mut app = App::new(true);
+        for ms in [15_000, 14_000, 16_000, 13_000, 12_500, 14_200, 13_100] {
+            app.data
+                .solves_mut()
+                .push(Solve::new(ms, Penalty::Ok, String::new()));
+        }
+        app.history = Some(3);
+        // a short chart, like a 1600x900 fullscreen terminal gives it
+        let out = render(&app, 140, 30);
+        assert!(out.contains("trend"));
+        // the legend, checked on the chart alone at the short height a
+        // fullscreen 1600x900 terminal gives it (other panels say "ao5" too)
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|f| draw_trend(f, f.area(), &app, 3)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let chart: String = (0..12u16)
+            .map(|y| (0..60u16).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(chart.contains("ao5") && chart.contains("time"), "{chart}");
+        // braille dots are drawn
+        assert!(out.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)));
+        // y-axis labels are the padded range in timer format
+        assert!(out.contains("12.") && out.contains("16."));
+    }
+
+    #[test]
+    fn trend_needs_two_finished_solves() {
+        let mut app = App::new(true);
+        app.data
+            .solves_mut()
+            .push(Solve::new(10_000, Penalty::Ok, String::new()));
+        app.data
+            .solves_mut()
+            .push(Solve::new(11_000, Penalty::Dnf, String::new()));
+        app.history = Some(0);
+        assert!(render(&app, 140, 44).contains("a trend needs two finished solves"));
+    }
+
+    #[test]
+    fn trend_survives_odd_data_and_small_windows() {
+        let mut app = App::new(true);
+        for ms in [10_000, 10_000, 10_000] {
+            app.data
+                .solves_mut()
+                .push(Solve::new(ms, Penalty::Ok, String::new())); // flat line
+        }
+        app.data
+            .solves_mut()
+            .push(Solve::new(1, Penalty::Plus2, String::new()));
+        app.history = Some(3);
+        for (w, h) in [(140, 44), (100, 30), (81, 22), (300, 80)] {
+            render(&app, w, h);
+        }
     }
 }

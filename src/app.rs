@@ -68,6 +68,22 @@ pub struct View {
     pub hint: String,
 }
 
+/// The key as typed. With the kitty keyboard protocol a shifted key arrives
+/// as its unshifted key plus SHIFT (Shift+/ is '/' with SHIFT, never '?'), so
+/// map letters to capitals and the two symbols cubetimer uses. Other layouts
+/// may put `?` and `+` elsewhere; F1 and `=` work everywhere.
+fn typed(key: KeyEvent) -> KeyCode {
+    match key.code {
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::SHIFT) => KeyCode::Char(match c {
+            'a'..='z' => c.to_ascii_uppercase(),
+            '/' => '?',
+            '=' => '+',
+            other => other,
+        }),
+        code => code,
+    }
+}
+
 pub struct App {
     pub state: State,
     pub data: Data,
@@ -77,10 +93,15 @@ pub struct App {
     pub status: Option<String>,
     /// Waiting for y/n to delete this solve (an index into `solves()`).
     pub confirm_delete: Option<usize>,
+    /// Waiting for y/n to delete the whole current session.
+    pub confirm_session_delete: bool,
     /// The history browser is open with this solve selected.
     pub history: Option<usize>,
     /// The key help overlay is open.
     pub show_help: bool,
+    /// The key last pressed and not yet released (with release events only),
+    /// to tell auto-repeat from a new press.
+    down: Option<KeyCode>,
     /// When the last solve set a new best single; drives the flash.
     pb_flash: Option<Instant>,
     pub inspection_on: bool,
@@ -108,7 +129,9 @@ impl App {
             status: None,
             confirm_delete: None,
             history: None,
+            confirm_session_delete: false,
             show_help: false,
+            down: None,
             pb_flash: None,
             inspection_on: true,
             enhanced,
@@ -191,77 +214,112 @@ impl App {
     }
 
     pub fn on_event(&mut self, ev: Event, now: Instant) {
-        if let Event::Key(key) = ev {
-            self.on_key(key, now);
+        match ev {
+            Event::Key(key) => self.on_key(key, now),
+            // A key let go while another window had focus sends no release.
+            Event::FocusLost => self.down = None,
+            _ => {}
         }
     }
 
     pub fn on_key(&mut self, key: KeyEvent, now: Instant) {
-        if key.kind == KeyEventKind::Repeat {
-            return;
-        }
-        let ctrl_c =
-            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-        if key.kind == KeyEventKind::Press && ctrl_c {
+        let code = typed(key);
+        if key.kind == KeyEventKind::Press
+            && code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
             self.quit = true;
             return;
         }
-        match key.kind {
+        // Holding a key auto-repeats it. kitty, foot and Alacritty mark the
+        // repeats as such; Ghostty and WezTerm send them as fresh presses, so
+        // when release events exist, a press of the key that is already down
+        // is a repeat too.
+        let repeat = match key.kind {
+            KeyEventKind::Repeat => true,
+            KeyEventKind::Press => self.enhanced && self.down.replace(key.code) == Some(key.code),
             KeyEventKind::Release => {
-                if key.code == KeyCode::Char(' ') {
+                if self.down == Some(key.code) {
+                    self.down = None;
+                }
+                if code == KeyCode::Char(' ') {
                     self.space_release(now);
                 }
+                return;
             }
-            KeyEventKind::Press => {
-                if matches!(self.state, State::Running { .. }) {
-                    self.stop(now);
-                    return;
-                }
-                self.status = None;
-                self.pb_flash = None;
-                if let Some(i) = self.confirm_delete.take() {
-                    if key.code == KeyCode::Char('y') {
-                        self.delete(i);
-                    }
-                    return;
-                }
-                if std::mem::take(&mut self.show_help) {
-                    return;
-                }
-                if let Some(selected) = self.history {
-                    self.history_key(key.code, selected);
-                    return;
-                }
-                let idle = self.state == State::Idle;
-                let last = self.solves().len().checked_sub(1);
-                match key.code {
-                    KeyCode::Char(' ') => self.space_press(now),
-                    KeyCode::Esc => self.cancel(),
-                    KeyCode::Char('q') => self.quit = true,
-                    KeyCode::Char('i') if idle => {
-                        self.inspection_on = !self.inspection_on;
-                        self.persist();
-                    }
-                    KeyCode::Char('+' | '=') if idle => self.mark(last, Penalty::Plus2),
-                    KeyCode::Char('d') if idle => self.mark(last, Penalty::Dnf),
-                    KeyCode::Char('o') if idle => self.mark(last, Penalty::Ok),
-                    KeyCode::Backspace if idle => self.confirm_delete = last,
-                    KeyCode::Char('h') if idle => self.history = last,
-                    KeyCode::Char('?') if idle => self.show_help = true,
-                    KeyCode::Char('n') if idle => self.new_session(),
-                    KeyCode::Char('[') if idle => self.switch_session(-1),
-                    KeyCode::Char(']') if idle => self.switch_session(1),
-                    KeyCode::Char('p') => self.run_display = self.run_display.next(),
-                    KeyCode::Char('b') => {
-                        self.bell = !self.bell;
-                        self.persist();
-                    }
-                    KeyCode::Char('f') => self.cycle_font(1),
-                    KeyCode::Char('F') => self.cycle_font(-1),
-                    _ => {}
-                }
+        };
+        if repeat {
+            // Auto-repeat only scrolls the history list.
+            let scrolls = matches!(
+                code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Char('j' | 'k')
+            );
+            if let Some(selected) = self.history
+                && self.confirm_delete.is_none()
+                && scrolls
+            {
+                self.history_key(code, selected);
             }
-            KeyEventKind::Repeat => {}
+            return;
+        }
+        if matches!(self.state, State::Running { .. }) {
+            self.stop(now);
+            return;
+        }
+        self.status = None;
+        self.pb_flash = None;
+        if std::mem::take(&mut self.confirm_session_delete) {
+            if code == KeyCode::Char('y') {
+                self.delete_session();
+            }
+            return;
+        }
+        if let Some(i) = self.confirm_delete.take() {
+            if code == KeyCode::Char('y') {
+                self.delete(i);
+            }
+            return;
+        }
+        if std::mem::take(&mut self.show_help) {
+            return;
+        }
+        if let Some(selected) = self.history {
+            self.history_key(code, selected);
+            return;
+        }
+        let idle = self.state == State::Idle;
+        let last = self.solves().len().checked_sub(1);
+        match code {
+            KeyCode::Char(' ') => self.space_press(now),
+            KeyCode::Esc => self.cancel(),
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('i') if idle => {
+                self.inspection_on = !self.inspection_on;
+                self.persist();
+            }
+            KeyCode::Char('+' | '=') if idle => self.mark(last, Penalty::Plus2),
+            KeyCode::Char('d') if idle => self.mark(last, Penalty::Dnf),
+            KeyCode::Char('o') if idle => self.mark(last, Penalty::Ok),
+            KeyCode::Backspace if idle => self.confirm_delete = last,
+            KeyCode::Char('h') if idle => self.history = last,
+            // `/` too: WezTerm sends Shift+/ without the SHIFT flag
+            KeyCode::Char('?' | '/') | KeyCode::F(1) if idle => self.show_help = true,
+            KeyCode::Char('n') if idle => self.new_session(),
+            KeyCode::Char('X') if idle => self.confirm_session_delete = true,
+            KeyCode::Char('[') if idle => self.switch_session(-1),
+            KeyCode::Char(']') if idle => self.switch_session(1),
+            KeyCode::Char('p') => self.run_display = self.run_display.next(),
+            KeyCode::Char('b') => {
+                self.bell = !self.bell;
+                self.persist();
+            }
+            KeyCode::Char('f') => self.cycle_font(1),
+            KeyCode::Char('F') => self.cycle_font(-1),
+            _ => {}
         }
     }
 
@@ -393,6 +451,19 @@ impl App {
         self.persist();
     }
 
+    /// Remove the current session and all its solves. The last session left
+    /// is emptied instead, so there is always one.
+    fn delete_session(&mut self) {
+        let sessions = &mut self.data.sessions;
+        if sessions.len() > 1 {
+            sessions.remove(self.data.current);
+            self.data.current = self.data.current.min(sessions.len() - 1);
+        } else {
+            sessions[0] = Session::default();
+        }
+        self.persist();
+    }
+
     fn switch_session(&mut self, step: isize) {
         let next = self.data.current.checked_add_signed(step);
         if let Some(i) = next.filter(|&i| i < self.data.sessions.len()) {
@@ -446,6 +517,15 @@ impl App {
     pub fn view(&self, now: Instant) -> View {
         let prec = self.precision;
         match self.state {
+            State::Idle if self.confirm_session_delete => View {
+                text: self.last_text(),
+                tone: Tone::Warn12,
+                hint: format!(
+                    "delete session {} and its {} solves? y / n",
+                    self.data.current + 1,
+                    self.solves().len()
+                ),
+            },
             State::Idle if self.confirm_delete.is_some() => View {
                 text: self.last_text(),
                 tone: Tone::Warn12,
@@ -640,6 +720,7 @@ mod tests {
             let t = Instant::now();
             let mut app = App::new(true);
             app.on_key(press(SPACE), at(t, 0));
+            app.on_key(release(SPACE), at(t, 80));
             app.on_key(press(SPACE), at(t, start_ms - 400));
             app.on_key(release(SPACE), at(t, start_ms));
             assert!(
@@ -654,6 +735,7 @@ mod tests {
         let t = Instant::now();
         let mut app = App::new(true);
         app.on_key(press(SPACE), at(t, 0));
+        app.on_key(release(SPACE), at(t, 80));
         app.on_key(press(SPACE), at(t, 15_000));
         app.on_key(release(SPACE), at(t, 15_400));
         app.on_key(press(SPACE), at(t, 25_400));
@@ -734,6 +816,7 @@ mod tests {
         app.on_key(press(SPACE), at(t, 0));
         app.on_key(release(SPACE), at(t, 400));
         app.on_key(press(KeyCode::Char('q')), at(t, 5_000));
+        app.on_key(release(KeyCode::Char('q')), at(t, 5_050));
         assert!(!app.quit);
         assert_eq!(app.solves().len(), 1);
         app.on_key(press(KeyCode::Char('q')), at(t, 5_100));
@@ -759,13 +842,12 @@ mod tests {
 
     #[test]
     fn inspection_toggle_only_when_idle() {
-        let t = Instant::now();
         let mut app = App::new(true);
-        app.on_key(press(KeyCode::Char('i')), t);
+        key(&mut app, KeyCode::Char('i'));
         assert!(!app.inspection_on);
-        app.on_key(press(KeyCode::Char('i')), t);
-        app.on_key(press(SPACE), t);
-        app.on_key(press(KeyCode::Char('i')), t);
+        key(&mut app, KeyCode::Char('i'));
+        key(&mut app, SPACE);
+        key(&mut app, KeyCode::Char('i'));
         assert!(app.inspection_on);
     }
 
@@ -775,6 +857,7 @@ mod tests {
         let mut app = App::new(true);
         assert_eq!(app.view(t).text, "0.00");
         app.on_key(press(SPACE), at(t, 0));
+        app.on_key(release(SPACE), at(t, 80));
         assert_eq!(app.view(at(t, 500)).text, "15");
         assert_eq!(app.view(at(t, 7_100)).text, "8");
         assert_eq!(app.view(at(t, 7_100)).tone, Tone::Inspect);
@@ -802,8 +885,10 @@ mod tests {
         assert_eq!(app.view(t).text, "14.34+");
     }
 
+    /// A full keystroke, press then release, like a real keyboard.
     fn key(app: &mut App, code: KeyCode) {
         app.on_key(press(code), Instant::now());
+        app.on_key(release(code), Instant::now());
     }
 
     fn with_solves(times: &[u64]) -> App {
@@ -990,6 +1075,7 @@ mod tests {
         app.on_key(press(SPACE), t);
         app.on_key(release(SPACE), at(t, 400));
         app.on_key(press(SPACE), at(t, 400 + ms));
+        app.on_key(release(SPACE), at(t, 450 + ms));
     }
 
     #[test]
@@ -1032,6 +1118,7 @@ mod tests {
             penalty: Penalty::Dnf,
         };
         app.on_key(press(KeyCode::Char('x')), at(t, 5_000));
+        app.on_key(release(KeyCode::Char('x')), at(t, 5_050));
         assert_eq!(app.view(at(t, 5_000)).tone, Tone::Idle);
         app.state = State::Running {
             start: t,
@@ -1074,8 +1161,10 @@ mod tests {
         let t = Instant::now();
         let mut app = App::new(true);
         app.on_key(press(SPACE), t); // inspection
+        app.on_key(release(SPACE), t);
         let before = app.font;
         app.on_key(press(KeyCode::Char('f')), t);
+        app.on_key(release(KeyCode::Char('f')), t);
         assert_ne!(app.font, before);
         app.state = State::Running {
             start: t,
@@ -1217,5 +1306,208 @@ mod tests {
         key(&mut app, KeyCode::Char('?'));
         app.on_key(ctrl_c, Instant::now());
         assert!(app.quit);
+    }
+
+    fn press_with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new_with_kind(code, modifiers, KeyEventKind::Press)
+    }
+
+    // What real keyboards send under the kitty protocol: the unshifted key
+    // plus SHIFT (checked in kitty, foot, Ghostty, Alacritty and WezTerm).
+    #[test]
+    fn shifted_keys_arrive_as_base_key_plus_shift() {
+        let shift = KeyModifiers::SHIFT;
+        let mut app = with_solves(&[10_000]);
+        app.on_key(press_with(KeyCode::Char('='), shift), Instant::now());
+        assert_eq!(app.solves()[0].penalty, Penalty::Plus2);
+
+        let mut app = App::new(true);
+        app.on_key(press_with(KeyCode::Char('/'), shift), Instant::now());
+        assert!(app.show_help, "Shift+/ is ?");
+
+        let mut app = App::new(true);
+        let start = app.font;
+        app.on_key(press_with(KeyCode::Char('f'), shift), Instant::now());
+        assert_eq!(
+            app.font,
+            (start + font::choices() - 1) % font::choices(),
+            "Shift+f is F"
+        );
+
+        let mut app = with_solves(&[1_000, 2_000, 3_000]);
+        key(&mut app, KeyCode::Char('h'));
+        app.on_key(press_with(KeyCode::Char('g'), shift), Instant::now());
+        assert_eq!(app.history, Some(0), "Shift+g is G (oldest)");
+    }
+
+    #[test]
+    fn wezterm_style_shift_slash_still_opens_help() {
+        // WezTerm reports the press of Shift+/ as a bare '/'
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('/'));
+        assert!(app.show_help);
+    }
+
+    #[test]
+    fn f1_opens_help_on_any_layout() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::F(1));
+        assert!(app.show_help);
+    }
+
+    // Ghostty and WezTerm send a held key's auto-repeat as more presses.
+    #[test]
+    fn repeated_presses_of_a_held_key_are_repeats() {
+        let t = Instant::now();
+        let mut app = App::new(true);
+        app.inspection_on = false;
+        app.state = State::Running {
+            start: t,
+            penalty: Penalty::Ok,
+        };
+        // stop with space and keep holding it: the repeats must not start
+        // a new attempt
+        app.on_key(press(SPACE), at(t, 9_000));
+        for ms in [9_500, 9_533, 9_566, 9_600] {
+            app.on_key(press(SPACE), at(t, ms));
+        }
+        app.on_key(release(SPACE), at(t, 9_700));
+        assert_eq!(app.state, State::Idle);
+        assert_eq!(app.solves().len(), 1);
+        // the next real tap works
+        app.on_key(press(SPACE), at(t, 10_000));
+        assert!(matches!(app.state, State::Holding { .. }));
+    }
+
+    #[test]
+    fn holding_space_from_idle_only_starts_inspection() {
+        let t = Instant::now();
+        let mut app = App::new(true);
+        app.on_key(press(SPACE), at(t, 0));
+        for ms in [500, 533, 566] {
+            app.on_key(press(SPACE), at(t, ms)); // auto-repeat as presses
+        }
+        app.on_key(release(SPACE), at(t, 900));
+        assert!(
+            matches!(app.state, State::Inspection { .. }),
+            "{:?}",
+            app.state
+        );
+    }
+
+    #[test]
+    fn holding_the_stop_key_does_not_quit_or_mark() {
+        let t = Instant::now();
+        for stop in ['q', 'd'] {
+            let mut app = App::new(true);
+            app.state = State::Running {
+                start: t,
+                penalty: Penalty::Ok,
+            };
+            app.on_key(press(KeyCode::Char(stop)), at(t, 5_000));
+            app.on_key(press(KeyCode::Char(stop)), at(t, 5_500)); // repeat
+            assert!(!app.quit, "{stop}");
+            assert_eq!(app.solves()[0].penalty, Penalty::Ok, "{stop}");
+        }
+    }
+
+    #[test]
+    fn without_release_events_every_press_counts() {
+        // basic mode can't tell repeats from presses, so it doesn't try
+        let t = Instant::now();
+        let mut app = App::new(false);
+        app.inspection_on = false;
+        app.on_key(press(SPACE), t);
+        assert!(matches!(app.state, State::Running { .. }));
+        app.on_key(press(SPACE), at(t, 3_000));
+        assert_eq!(app.solves().len(), 1);
+    }
+
+    #[test]
+    fn holding_up_or_down_scrolls_history() {
+        let mut app = with_solves(&[1_000, 2_000, 3_000, 4_000, 5_000]);
+        key(&mut app, KeyCode::Char('h'));
+        let t = Instant::now();
+        // kitty-style repeats
+        app.on_key(press(KeyCode::Down), t);
+        let rep = KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat);
+        app.on_key(rep, t);
+        app.on_key(release(KeyCode::Down), t);
+        assert_eq!(app.history, Some(2));
+        // Ghostty-style repeats (more presses)
+        app.on_key(press(KeyCode::Down), t);
+        app.on_key(press(KeyCode::Down), t);
+        app.on_key(release(KeyCode::Down), t);
+        assert_eq!(app.history, Some(0));
+        // but repeats of other keys do nothing there
+        app.on_key(press(KeyCode::Char('d')), t);
+        app.on_key(press(KeyCode::Char('d')), t);
+        assert_eq!(app.solves()[0].penalty, Penalty::Dnf);
+    }
+
+    #[test]
+    fn losing_focus_forgets_a_held_key() {
+        let t = Instant::now();
+        let mut app = with_solves(&[1_000]);
+        app.on_key(press(KeyCode::Char('d')), t);
+        app.on_event(Event::FocusLost, t); // released in another window
+        app.on_key(press(KeyCode::Char('o')), t);
+        app.on_key(release(KeyCode::Char('o')), t);
+        app.on_key(press(KeyCode::Char('d')), t);
+        assert_eq!(app.solves()[0].penalty, Penalty::Dnf);
+        let mut app = with_solves(&[1_000]);
+        app.on_key(press(KeyCode::Char('i')), t);
+        app.on_event(Event::FocusLost, t);
+        app.on_key(press(KeyCode::Char('i')), t); // a new press, not a repeat
+        assert!(app.inspection_on);
+    }
+
+    #[test]
+    fn deleting_a_session_asks_first_and_keeps_the_others() {
+        let mut app = with_solves(&[1_000, 2_000]);
+        key(&mut app, KeyCode::Char('n'));
+        app.data
+            .solves_mut()
+            .push(Solve::new(5_000, Penalty::Ok, String::new()));
+        key(&mut app, KeyCode::Char('n'));
+        app.data
+            .solves_mut()
+            .push(Solve::new(7_000, Penalty::Ok, String::new()));
+        key(&mut app, KeyCode::Char('[')); // session 2 of 3
+        key(&mut app, KeyCode::Char('X'));
+        assert_eq!(
+            app.view(Instant::now()).hint,
+            "delete session 2 and its 1 solves? y / n"
+        );
+        key(&mut app, KeyCode::Char('n')); // anything but y cancels
+        assert_eq!(app.data.sessions.len(), 3);
+        key(&mut app, KeyCode::Char('X'));
+        key(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.data.sessions.len(), 2);
+        assert_eq!(app.solves()[0].ms, 7_000); // now on what was session 3
+        assert_eq!(app.data.sessions[0].solves.len(), 2);
+    }
+
+    #[test]
+    fn deleting_the_last_session_empties_it() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('X'));
+        key(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.data.sessions.len(), 1);
+        assert!(app.solves().is_empty());
+    }
+
+    #[test]
+    fn deleting_the_final_session_index_moves_back() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('n'));
+        app.data
+            .solves_mut()
+            .push(Solve::new(2_000, Penalty::Ok, String::new()));
+        assert_eq!(app.data.current, 1);
+        key(&mut app, KeyCode::Char('X'));
+        key(&mut app, KeyCode::Char('y'));
+        assert_eq!((app.data.current, app.data.sessions.len()), (0, 1));
+        assert_eq!(app.solves()[0].ms, 1_000);
     }
 }

@@ -23,6 +23,7 @@ random-state scrambles.
 Usage: cubetimer [OPTIONS]
 
 Options:
+      --export   Print every solve as CSV (for spreadsheets) and exit
   -h, --help     Print this help
   -V, --version  Print the version
 
@@ -34,6 +35,7 @@ enum Action {
     Run,
     Help,
     Version,
+    Export,
     Unknown(String),
 }
 
@@ -42,6 +44,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Action {
         None => Action::Run,
         Some("-h" | "--help") => Action::Help,
         Some("-V" | "--version") => Action::Version,
+        Some("--export") => Action::Export,
         Some(other) => Action::Unknown(other.to_string()),
     }
 }
@@ -56,6 +59,23 @@ fn main() -> ExitCode {
         Action::Version => {
             println!("cubetimer {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
+        }
+        Action::Export => {
+            // Reading needs no lock: saves replace the file atomically.
+            let Some(path) = store::default_path() else {
+                eprintln!("cubetimer: no data directory");
+                return ExitCode::FAILURE;
+            };
+            return match store::read(&path) {
+                Ok(data) => {
+                    print!("{}", store::to_csv(&data));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("cubetimer: can't read {}: {e}", path.display());
+                    ExitCode::FAILURE
+                }
+            };
         }
         Action::Unknown(arg) => {
             eprintln!("cubetimer: unknown option '{arg}'\nTry 'cubetimer --help'.");
@@ -120,6 +140,7 @@ mod tests {
         assert_eq!(args(&["--help"]), Action::Help);
         assert_eq!(args(&["-V"]), Action::Version);
         assert_eq!(args(&["--version"]), Action::Version);
+        assert_eq!(args(&["--export"]), Action::Export);
         assert_eq!(args(&["--bogus"]), Action::Unknown("--bogus".into()));
     }
 }

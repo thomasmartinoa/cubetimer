@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::fmt;
 use crate::stats::{Penalty, TimeResult};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +112,43 @@ pub struct Loaded {
     pub warning: Option<String>,
 }
 
+/// Every solve as CSV, one row per solve, for spreadsheets and other tools.
+/// Times are in seconds with millisecond precision; `result` is the time with
+/// its penalty applied, or `DNF`.
+pub fn to_csv(data: &Data) -> String {
+    let field = |f: &str| {
+        if f.contains([',', '"', '\n']) {
+            format!("\"{}\"", f.replace('"', "\"\""))
+        } else {
+            f.to_string()
+        }
+    };
+    let secs = |ms: u64| format!("{}.{:03}", ms / 1000, ms % 1000);
+    let mut out = String::from("session,solve,time,penalty,result,scramble,date\n");
+    for (si, session) in data.sessions.iter().enumerate() {
+        for (i, s) in session.solves.iter().enumerate() {
+            let penalty = match s.penalty {
+                Penalty::Ok => "ok",
+                Penalty::Plus2 => "+2",
+                Penalty::Dnf => "dnf",
+            };
+            let result = match s.result() {
+                TimeResult::Ms(ms) => secs(ms),
+                TimeResult::Dnf => "DNF".into(),
+            };
+            out += &format!(
+                "{},{},{},{penalty},{result},{},{}\n",
+                si + 1,
+                i + 1,
+                secs(s.ms),
+                field(&s.scramble),
+                fmt::fmt_iso(s.ts)
+            );
+        }
+    }
+    out
+}
+
 pub fn default_path() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("cubetimer").join("sessions.json"))
 }
@@ -118,23 +156,28 @@ pub fn default_path() -> Option<PathBuf> {
 /// Load sessions. A missing file is an empty store. A file that can't be
 /// parsed is renamed to `*.corrupt` (so the next save can't destroy it) and an
 /// empty store is returned with a warning.
+/// Read the sessions without changing anything on disk. A missing file is an
+/// empty store; an unreadable one is an error saying why.
+pub fn read(path: &Path) -> Result<Data, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str::<Data>(&text)
+            .map(Data::normalize)
+            .map_err(|e| e.to_string()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Data::default()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Load sessions for the timer. Like `read`, but a file that can't be read is
+/// renamed to `*.corrupt` (so the next save can't destroy it) and an empty
+/// store is returned with a warning.
 pub fn load(path: &Path) -> Loaded {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Loaded {
-                data: Data::default(),
-                warning: None,
-            };
-        }
-        Err(e) => return set_aside(path, &e.to_string()),
-    };
-    match serde_json::from_str::<Data>(&text) {
+    match read(path) {
         Ok(data) => Loaded {
-            data: data.normalize(),
+            data,
             warning: None,
         },
-        Err(e) => set_aside(path, &e.to_string()),
+        Err(reason) => set_aside(path, &reason),
     }
 }
 
@@ -267,6 +310,39 @@ mod tests {
         };
         save(&path, &data).unwrap();
         assert_eq!(load(&path).data.settings, data.settings);
+    }
+
+    #[test]
+    fn read_never_moves_a_damaged_file() {
+        let dir = temp_dir("read");
+        let path = dir.join("sessions.json");
+        fs::write(&path, "{ not json").unwrap();
+        assert!(read(&path).is_err());
+        assert!(path.exists());
+        assert!(!dir.join("sessions.json.corrupt").exists());
+        assert_eq!(read(&dir.join("missing.json")).unwrap(), Data::default());
+    }
+
+    #[test]
+    fn csv_export() {
+        let csv = to_csv(&sample());
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "session,solve,time,penalty,result,scramble,date");
+        assert_eq!(lines[1], "1,1,12.340,+2,14.340,R U,1970-01-01T00:00:07Z");
+        assert_eq!(lines[2], "1,2,9.990,dnf,DNF,F2,1970-01-01T00:00:08Z");
+        assert_eq!(lines.len(), 3); // the second session is empty
+    }
+
+    #[test]
+    fn csv_quotes_awkward_fields() {
+        let mut data = Data::default();
+        data.solves_mut().push(Solve {
+            ms: 5,
+            penalty: Penalty::Ok,
+            scramble: "a,\"b\"".into(),
+            ts: 0,
+        });
+        assert!(to_csv(&data).contains(",0.005,\"a,\"\"b\"\"\","));
     }
 
     #[test]
