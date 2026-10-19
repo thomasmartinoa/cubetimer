@@ -1,5 +1,7 @@
 # cubetimer
 
+[![CI](https://github.com/thomasmartinoa/cubetimer/actions/workflows/ci.yml/badge.svg)](https://github.com/thomasmartinoa/cubetimer/actions/workflows/ci.yml)
+
 A full-screen speedcubing timer for your terminal. Big ASCII digits, the WCA 15-second
 inspection, hold-and-release start like a Stackmat, WCA-style random-state scrambles with a
 preview of the scrambled cube, and live ao5 / ao12 / ao100 stats.
@@ -7,8 +9,9 @@ preview of the scrambled cube, and live ao5 / ao12 / ao100 stats.
 ![cubetimer, idle: scramble, big last time, stats and recent solves](docs/screenshots/idle.png)
 
 Built for [kitty](https://sw.kovidgoyal.net/kitty/) and written in Rust with
-[ratatui](https://ratatui.rs). It only uses your terminal's ANSI colors, so it picks up
-whatever theme you already run.
+[ratatui](https://ratatui.rs). Apart from the cube preview, which shows the real sticker
+colors, it only uses your terminal's ANSI colors, so it picks up whatever theme you
+already run.
 
 ## Features
 
@@ -94,7 +97,7 @@ kitty --start-as=fullscreen cubetimer
 | `f` / `F` | Next / previous digit font (`auto` first) |
 | `p` | Cycle the running display: `0.01`, whole seconds, hidden |
 | `b` | Turn the inspection bell on or off |
-| `?` or `F1` | Show all keys |
+| `?` or `F1` | Show all keys (`/` works too) |
 | `q` / `Ctrl-C` | Quit (`q` stops the timer if one is running; `Ctrl-C` always quits) |
 
 The mark, delete, history, session, `i` and `?` keys work only when the timer is idle.
@@ -105,9 +108,9 @@ In the history browser, `↑`/`↓` (or `k`/`j`), `PgUp`/`PgDn` and `Home`/`End`
 `o` mark the selected solve, `Backspace` deletes it (asks first) and `Esc` closes.
 
 `cubetimer --help` and `cubetimer --version` work as usual. `cubetimer --export > solves.csv`
-saves every solve (session, number, time, penalty, result, scramble, UTC date) as CSV. Starting a second copy while
-one is running prints `already running` and exits, so two copies can't overwrite each
-other's solves.
+saves every solve as CSV, one row each: session, number, time, penalty, result, scramble
+and UTC date. Starting a second copy while one is running prints `already running` and
+exits, so two copies can't overwrite each other's solves.
 
 Solves are stored in `$XDG_DATA_HOME/cubetimer/sessions.json` (usually
 `~/.local/share/cubetimer/sessions.json`) and written atomically after every change. If
@@ -221,8 +224,9 @@ for help. Terminals disagree on some details (Ghostty and WezTerm send a held ke
 auto-repeat as new presses; WezTerm leaves out Shift on shifted keys), and cubetimer
 handles each of them.
 
-If hold-to-start doesn't behave, run the key tester and check that you see `Press`,
-`Repeat` and `Release` lines for space:
+If hold-to-start doesn't behave, run the key tester, hold space for a second and check
+that you see a `Press` line and then a `Release` line (in between, kitty, foot and
+Alacritty show `Repeat` lines; Ghostty and WezTerm show more `Press` lines):
 
 ```sh
 cargo run --example keytest
@@ -235,7 +239,9 @@ The first line should say `keyboard enhancement: ON`.
 ## Limitations
 
 - 3x3 only.
-- No graphs, Bluetooth smart cubes, csTimer import/export, or session names.
+- No import from csTimer or other timers (export to CSV is supported), no session names,
+  and no Bluetooth smart cubes.
+- The hold time before the timer is ready is fixed at 0.3 s.
 - The scramble preview uses true color (24-bit), which every terminal listed above
   supports.
 
@@ -243,7 +249,7 @@ The first line should say `keyboard enhancement: ON`.
 
 ```sh
 cargo test                 # cube model, solver, scrambles, formatting, stats, fonts, state machine, layouts
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
 cargo run --example keytest
 cargo run --release --example scramblebench -- 2000   # solver speed and scramble lengths
 ```
