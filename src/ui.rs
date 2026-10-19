@@ -12,9 +12,9 @@ use ratatui::widgets::{
 };
 
 use crate::app::{App, Tone};
-use crate::cube;
 use crate::fmt;
 use crate::font;
+use crate::nxn;
 use crate::stats::{self, Penalty, TimeResult};
 
 fn tone_color(tone: Tone) -> Color {
@@ -38,12 +38,8 @@ const COMPACT_MIN_HEIGHT: u16 = 8;
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     if area.width >= FULL_MIN.0 && area.height >= FULL_MIN.1 {
-        // One line for the scramble when it fits, two when it has to wrap.
-        let scramble_lines = if app.scramble.len() + 4 <= area.width as usize {
-            1
-        } else {
-            2
-        };
+        // As many lines as the scramble needs once wrapped (100 moves on 7x7).
+        let scramble_lines = wrapped_lines(&app.scramble, (area.width as usize).saturating_sub(4));
         let [scramble, main, stats, footer] = Layout::vertical([
             Constraint::Length(scramble_lines + 2),
             Constraint::Min(0),
@@ -56,12 +52,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_stats(frame, stats, app);
         draw_footer(frame, footer, app);
     } else if area.height >= COMPACT_MIN_HEIGHT {
-        // The scramble gets a second line when it won't fit on one.
-        let scramble_h = if area.width as usize >= app.scramble.len() + 2 {
-            1
-        } else {
-            2
-        };
+        let scramble_h = wrapped_lines(&app.scramble, area.width as usize);
         let [scramble, main, stats, footer] = Layout::vertical([
             Constraint::Length(scramble_h),
             Constraint::Min(0),
@@ -84,6 +75,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.show_help {
         draw_help(frame, area);
     }
+    if app.show_preview {
+        draw_big_preview(frame, area, app);
+    }
+    if let Some(selected) = app.picker {
+        draw_picker(frame, area, app, selected);
+    }
 }
 
 /// The big time, or the history browser when it is open.
@@ -97,6 +94,28 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
 fn dim() -> Style {
     Style::new().fg(Color::DarkGray)
 }
+
+/// Lines `text` takes when wrapped at word boundaries to `width` columns,
+/// between 1 and `MAX_SCRAMBLE_LINES`.
+fn wrapped_lines(text: &str, width: usize) -> u16 {
+    let width = width.max(1);
+    let (mut lines, mut used) = (1u16, 0usize);
+    for word in text.split_whitespace() {
+        let len = word.chars().count();
+        if used == 0 {
+            used = len;
+        } else if used + 1 + len <= width {
+            used += 1 + len;
+        } else {
+            lines += 1;
+            used = len;
+        }
+    }
+    lines.min(MAX_SCRAMBLE_LINES)
+}
+
+/// A 7x7 scramble of 100 moves needs about four lines in a normal window.
+const MAX_SCRAMBLE_LINES: u16 = 8;
 
 /// The scramble, or a placeholder while the first one is being made.
 fn scramble_text(app: &App) -> Span<'_> {
@@ -174,9 +193,20 @@ fn draw_stats(frame: &mut Frame, area: Rect, app: &App) {
     };
     draw_stats_grid(frame, left, app);
     if let Some(p) = preview {
-        draw_preview(frame, p, &app.scramble, "preview");
+        draw_preview(frame, p, &app.scramble, app.puzzle().size(), "preview");
     }
     draw_recent(frame, right, app);
+}
+
+/// This session's place among the sessions of the same puzzle: (2, 3) is the
+/// second of three.
+fn session_position(app: &App) -> (usize, usize) {
+    let of_puzzle = app.data.sessions_of(app.puzzle());
+    let at = of_puzzle
+        .iter()
+        .position(|&i| i == app.data.current)
+        .unwrap_or(0);
+    (at + 1, of_puzzle.len())
 }
 
 fn draw_stats_grid(frame: &mut Frame, area: Rect, app: &App) {
@@ -218,10 +248,10 @@ fn draw_stats_grid(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(spans)
         })
         .collect();
+    let (number, count) = session_position(app);
     let title = format!(
-        " stats - session {}/{} ",
-        app.data.current + 1,
-        app.data.sessions.len()
+        " stats - {} - session {number}/{count} ",
+        app.puzzle().name()
     );
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(title).border_style(dim())),
@@ -242,43 +272,93 @@ const STICKER_COLORS: [Color; 6] = [
 
 /// The scrambled cube as a net (U on top, L F R B across, D below), each
 /// sticker a square half a character tall.
-fn draw_preview(frame: &mut Frame, area: Rect, scramble: &str, title: &str) {
+fn draw_preview(frame: &mut Frame, area: Rect, scramble: &str, size: usize, title: &str) {
     let block = Block::bordered()
         .title(format!(" {title} "))
         .border_style(dim());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     // nothing to show yet (or a solve saved without one)
-    if scramble.is_empty() {
-        return;
-    }
-    let Some(moves) = cube::parse(scramble) else {
+    let Some(grid) = net_grid(scramble, size) else {
         return;
     };
-    let stickers = cube::SOLVED.apply_all(&moves).facelets();
+    let (rows, cols) = (net_rows(&grid), grid[0].len());
+    if inner.height as usize >= rows && inner.width as usize >= cols {
+        let [net] = Layout::vertical([Constraint::Length(rows as u16)])
+            .flex(Flex::Center)
+            .areas(inner);
+        frame.render_widget(
+            Paragraph::new(net_lines(&grid, 1)).alignment(Alignment::Center),
+            net,
+        );
+    } else {
+        // too big for this box: point at the full-screen view
+        frame.render_widget(
+            Paragraph::new("v: full view")
+                .style(dim())
+                .alignment(Alignment::Center),
+            inner,
+        );
+    }
+}
 
-    // Sticker grid: 15 columns (four faces with gaps), 11 half-rows.
-    let at = |row: usize, col: usize| -> Option<Color> {
-        let (band, r) = (row / 4, row % 4);
-        let (slot, c) = (col / 4, col % 4);
-        if r == 3 || c == 3 {
+/// The net of the cube after `scramble` as a grid of sticker colors (`None`
+/// for the gaps), `3 * size + 2` half-rows by `4 * size + 3` columns.
+/// `None` if there is no scramble or it can't be read.
+fn net_grid(scramble: &str, size: usize) -> Option<Vec<Vec<Option<Color>>>> {
+    if scramble.is_empty() {
+        return None;
+    }
+    let moves = nxn::parse(scramble)?;
+    let mut cube = nxn::Nxn::solved(size);
+    cube.apply_all(&moves);
+    let stickers = cube.facelets();
+    let pitch = size + 1;
+    let grid = (0..3 * pitch - 1)
+        .map(|row| {
+            (0..4 * pitch - 1)
+                .map(|col| {
+                    let (band, r) = (row / pitch, row % pitch);
+                    let (slot, c) = (col / pitch, col % pitch);
+                    if r == size || c == size {
+                        return None;
+                    }
+                    let face = match (band, slot) {
+                        (0, 1) => 0, // U
+                        (1, 0) => 4, // L
+                        (1, 1) => 2, // F
+                        (1, 2) => 1, // R
+                        (1, 3) => 5, // B
+                        (2, 1) => 3, // D
+                        _ => return None,
+                    };
+                    Some(STICKER_COLORS[stickers[face * size * size + r * size + c] as usize])
+                })
+                .collect()
+        })
+        .collect();
+    Some(grid)
+}
+
+/// Text rows the net takes (two half-rows each).
+fn net_rows(grid: &[Vec<Option<Color>>]) -> usize {
+    grid.len().div_ceil(2)
+}
+
+/// The net as lines of half blocks, every sticker `scale` columns wide and
+/// `scale` half-rows tall.
+fn net_lines(grid: &[Vec<Option<Color>>], scale: usize) -> Vec<Line<'static>> {
+    let (rows, cols) = (grid.len() * scale, grid[0].len() * scale);
+    let cell = |row: usize, col: usize| -> Option<Color> {
+        if row >= rows {
             return None;
         }
-        let face = match (band, slot) {
-            (0, 1) => 0, // U
-            (1, 0) => 4, // L
-            (1, 1) => 2, // F
-            (1, 2) => 1, // R
-            (1, 3) => 5, // B
-            (2, 1) => 3, // D
-            _ => return None,
-        };
-        Some(STICKER_COLORS[stickers[face * 9 + r * 3 + c] as usize])
+        grid[row / scale][col / scale]
     };
-    let lines: Vec<Line> = (0..6)
+    (0..rows.div_ceil(2))
         .map(|y| {
-            let spans: Vec<Span> = (0..15)
-                .map(|x| match (at(2 * y, x), at(2 * y + 1, x)) {
+            let spans: Vec<Span> = (0..cols)
+                .map(|x| match (cell(2 * y, x), cell(2 * y + 1, x)) {
                     (Some(top), Some(bottom)) => {
                         Span::styled("\u{2580}", Style::new().fg(top).bg(bottom))
                     }
@@ -289,11 +369,91 @@ fn draw_preview(frame: &mut Frame, area: Rect, scramble: &str, title: &str) {
                 .collect();
             Line::from(spans)
         })
-        .collect();
-    let [net] = Layout::vertical([Constraint::Length(6)])
+        .collect()
+}
+
+/// The full-screen scramble preview (`v`): the net as large as fits.
+fn draw_big_preview(frame: &mut Frame, area: Rect, app: &App) {
+    let size = app.puzzle().size();
+    let Some(grid) = net_grid(&app.scramble, size) else {
+        return;
+    };
+    let (rows, cols) = (grid.len(), grid[0].len());
+    // each sticker at least one column and half-row, up to 4 when there is room
+    let scale = (1..=4usize)
+        .rev()
+        .find(|&k| {
+            cols * k + 4 <= area.width as usize
+                && (rows * k).div_ceil(2) + 4 <= area.height as usize
+        })
+        .unwrap_or(1);
+    let width = (cols * scale + 4).min(area.width as usize) as u16;
+    let height = ((rows * scale).div_ceil(2) + 4).min(area.height as usize) as u16;
+    let [popup] = Layout::horizontal([Constraint::Length(width)])
         .flex(Flex::Center)
-        .areas(inner);
-    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), net);
+        .areas(area);
+    let [popup] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(popup);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(format!(" {} scramble preview ", app.puzzle().name()))
+        .title_bottom(Line::from(" any key closes ").right_aligned());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(net_lines(&grid, scale)).alignment(Alignment::Center),
+        Rect {
+            y: inner.y + 1,
+            height: inner.height.saturating_sub(1),
+            ..inner
+        },
+    );
+}
+
+/// The puzzle picker (`e`).
+fn draw_picker(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
+    let current = app.puzzle();
+    let lines: Vec<Line> = crate::puzzle::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let mark = if *p == current { "*" } else { " " };
+            let style = if i == selected {
+                Style::new().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new()
+            };
+            let used = app
+                .data
+                .sessions_of(*p)
+                .iter()
+                .map(|&s| app.data.sessions[s].solves.len())
+                .sum::<usize>();
+            Line::from(Span::styled(
+                format!(" {mark} {}  {used:>5} solves ", p.name()),
+                style,
+            ))
+        })
+        .collect();
+    let height = (lines.len() as u16 + 4).min(area.height);
+    let width = 28.min(area.width);
+    let [popup] = Layout::horizontal([Constraint::Length(width)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [popup] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" puzzle ")
+                .title_bottom(Line::from(" enter picks, 2-7 jump ").right_aligned())
+                .padding(Padding::vertical(1)),
+        ),
+        popup,
+    );
 }
 
 /// Recent solves, newest first, in aligned columns. +2 and DNF are colored and
@@ -342,15 +502,15 @@ fn draw_recent(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_stats_line(frame: &mut Frame, area: Rect, app: &App) {
     let prec = app.precision;
     let s = app.summary();
+    let (number, count) = session_position(app);
     let text = format!(
-        "best {}  ao5 {}  ao12 {}  mean {}  n={}  s{}/{}",
+        "{} best {}  ao5 {}  ao12 {}  mean {}  n={}  s{number}/{count}",
+        app.puzzle().name(),
         fmt::fmt_single(s.best, prec),
         fmt::fmt_avg(s.ao5, prec),
         fmt::fmt_avg(s.ao12, prec),
         s.mean.map_or("-".into(), |m| fmt::fmt_avg_ms(m, prec)),
         s.count,
-        app.data.current + 1,
-        app.data.sessions.len(),
     );
     frame.render_widget(
         Paragraph::new(text)
@@ -365,7 +525,7 @@ fn draw_stats_line(frame: &mut Frame, area: Rect, app: &App) {
 fn footer_text(app: &App, width: usize) -> String {
     let on = |b: bool| if b { "on" } else { "off" };
     // (priority: lower stays longer, text), in display order
-    let parts: [(u8, String); 11] = [
+    let parts: [(u8, String); 12] = [
         (1, "space go".into()),
         (6, "+/d/o mark".into()),
         (8, "bksp delete".into()),
@@ -373,6 +533,7 @@ fn footer_text(app: &App, width: usize) -> String {
         (9, "n [ ] session".into()),
         (5, format!("i inspect:{}", on(app.inspection_on))),
         (4, format!("f font:{}", font::name_at(app.font))),
+        (4, format!("e puzzle:{}", app.puzzle().name())),
         (10, "p display".into()),
         (11, format!("b bell:{}", on(app.bell))),
         (3, "? help".into()),
@@ -380,7 +541,7 @@ fn footer_text(app: &App, width: usize) -> String {
     ];
     let mut order: Vec<usize> = (0..parts.len()).collect();
     order.sort_by_key(|&i| parts[i].0);
-    let mut keep = [false; 11];
+    let mut keep = [false; 12];
     let mut used = 1;
     for i in order {
         let need = parts[i].1.chars().count() + 2;
@@ -416,13 +577,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Every key, for the `?` overlay.
-const HELP: [(&str, &str); 18] = [
+const HELP: [(&str, &str); 20] = [
     ("space", "inspect, hold and release to start, stop"),
     ("any key", "stop a running solve"),
     ("esc", "cancel inspection or a hold"),
     ("+ / d / o", "mark the last solve +2, DNF or OK"),
     ("backspace", "delete the last solve (asks y / n)"),
     ("h", "history: browse, mark and delete any solve"),
+    ("e", "choose the puzzle: 2x2 to 7x7"),
+    ("v", "full-screen scramble preview"),
     ("n", "new session"),
     ("[ / ]", "previous / next session"),
     ("X", "delete the whole session (asks y / n)"),
@@ -571,7 +734,7 @@ fn draw_history(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text);
     if !solve.scramble.is_empty() && preview.width >= PREVIEW_WIDTH {
         let [p] = Layout::horizontal([Constraint::Length(PREVIEW_WIDTH)]).areas(preview);
-        draw_preview(frame, p, &solve.scramble, "state");
+        draw_preview(frame, p, &solve.scramble, app.puzzle().size(), "state");
     }
     if chart.width > 0 {
         draw_trend(frame, chart, app, selected);
@@ -727,7 +890,7 @@ mod tests {
         let out = render(&app(), 100, 30);
         for want in [
             "scramble",
-            "stats - session 1/1",
+            "stats - 3x3 - session 1/1",
             "recent times",
             "ao100",
             "q quit",
@@ -1172,5 +1335,136 @@ mod tests {
         for (w, h) in [(140, 44), (100, 30), (81, 22), (300, 80)] {
             render(&app, w, h);
         }
+    }
+
+    #[test]
+    fn the_net_grid_has_the_expected_shape_for_every_size() {
+        for n in 2..=7usize {
+            let grid = net_grid("R U", n).unwrap();
+            assert_eq!((grid.len(), grid[0].len()), (3 * n + 2, 4 * n + 3), "{n}");
+            assert!(grid.iter().all(|r| r.len() == 4 * n + 3));
+            // 6 faces of n x n stickers, nothing in the gaps
+            let stickers: usize = grid.iter().map(|r| r.iter().flatten().count()).sum();
+            assert_eq!(stickers, 6 * n * n, "{n}");
+        }
+        assert!(net_grid("", 3).is_none());
+        assert!(net_grid("not a scramble", 3).is_none());
+    }
+
+    #[test]
+    fn a_solved_net_has_n_squared_stickers_of_each_color() {
+        for n in 2..=7usize {
+            let grid = net_grid("U U'", n).unwrap(); // solved again
+            for color in STICKER_COLORS {
+                let count = grid
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|&&c| c == color)
+                    .count();
+                assert_eq!(count, n * n, "{n} {color:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_net_shows_the_right_colors_after_a_move() {
+        // after R on a 3x3 the top face's right column is green (F's color)
+        let grid = net_grid("R", 3).unwrap();
+        let green = STICKER_COLORS[2];
+        let white = STICKER_COLORS[0];
+        // U face is at band 0, slot 1: columns 4..7, rows 0..3
+        assert_eq!(grid[0][6], Some(green));
+        assert_eq!(grid[1][6], Some(green));
+        assert_eq!(grid[2][6], Some(green));
+        assert_eq!(grid[0][4], Some(white));
+    }
+
+    #[test]
+    fn every_size_renders_its_preview_in_a_normal_window() {
+        for (digit, n) in [('2', 2), ('3', 3), ('4', 4), ('5', 5), ('6', 6), ('7', 7)] {
+            let mut app = app();
+            crate::app::tests_support::set_puzzle(&mut app, digit);
+            app.scramble = "R U".into(); // switching clears it, so set it after
+            let out = render(&app, 140, 44);
+            assert!(
+                out.contains(&format!("stats - {n}x{n} - session 1/1")),
+                "{n}"
+            );
+            if n <= 3 {
+                assert!(out.contains('\u{2580}'), "{n}: net in the panel");
+            } else {
+                assert!(out.contains("v: full view"), "{n}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_full_preview_shows_every_size_big() {
+        for digit in ['2', '4', '7'] {
+            let mut app = app();
+            crate::app::tests_support::set_puzzle(&mut app, digit);
+            app.scramble = "R U".into(); // switching clears it, so set it after
+            app.show_preview = true;
+            let out = render(&app, 120, 40);
+            assert!(out.contains("scramble preview"), "{digit}");
+            assert!(out.contains("any key closes"));
+            let blocks = out
+                .chars()
+                .filter(|&c| c == '\u{2580}' || c == '\u{2584}')
+                .count();
+            assert!(blocks > 40, "{digit}: {blocks}");
+        }
+        // and never panics when there is no room
+        let mut app = app();
+        app.scramble = "R U".into();
+        app.show_preview = true;
+        for (w, h) in [(10, 5), (30, 10), (60, 12)] {
+            render(&app, w, h);
+        }
+    }
+
+    #[test]
+    fn the_picker_lists_every_puzzle_and_marks_the_current_one() {
+        let mut app = app();
+        app.picker = Some(0);
+        let out = render(&app, 100, 30);
+        for name in ["2x2", "3x3", "4x4", "5x5", "6x6", "7x7"] {
+            assert!(out.contains(name), "{name}");
+        }
+        assert!(out.contains("* 3x3"), "the current puzzle has a star");
+        assert!(out.contains("enter picks"));
+        for (w, h) in [(10, 3), (30, 8)] {
+            render(&app, w, h);
+        }
+    }
+
+    #[test]
+    fn long_scrambles_wrap_into_as_many_lines_as_they_need() {
+        assert_eq!(wrapped_lines("R U F", 80), 1);
+        assert_eq!(wrapped_lines("", 80), 1);
+        let hundred = vec!["Rw2"; 100].join(" "); // 399 characters
+        assert_eq!(wrapped_lines(&hundred, 100), 4);
+        assert_eq!(wrapped_lines(&hundred, 40), 8, "capped");
+        // a word that's too wide for the line still gets one
+        assert_eq!(wrapped_lines("abcdefghij", 3), 1);
+        assert_eq!(wrapped_lines("ab cd ef", 5), 2);
+        assert_eq!(wrapped_lines("ab cd ef", 4), 3);
+    }
+
+    #[test]
+    fn a_100_move_scramble_is_fully_shown() {
+        let mut app = app();
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(7);
+        crate::app::tests_support::set_puzzle(&mut app, '7');
+        app.scramble = nxn::format(&nxn::random_moves(7, 100, &mut rng));
+        let out = render(&app, 120, 44);
+        for token in app.scramble.split_whitespace() {
+            assert!(out.contains(token), "missing {token}");
+        }
+        // and the time display still has room
+        assert!(out.contains("stats - 7x7"));
+        render(&app, 80, 24);
+        render(&app, 60, 20);
     }
 }

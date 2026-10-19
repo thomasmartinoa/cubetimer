@@ -1,14 +1,20 @@
-//! WCA random-state 3x3x3 scrambles, made the way the official TNoodle program
-//! makes them: pick a cube state uniformly at random from all states that need
-//! at least 2 moves to solve (Regulation 4b3), find a solution of at most 21
-//! moves with the two-phase algorithm, and give its inverse as the scramble.
+//! WCA-style scrambles, made the way the official TNoodle program makes them.
+//!
+//! 3x3x3: pick a cube state uniformly at random from all states that need at
+//! least 2 moves to solve (Regulation 4b3), find a solution of at most 21 moves
+//! with the two-phase algorithm, and give its inverse as the scramble.
+//! 2x2x2: a uniformly random state needing at least 4 moves (see `twobytwo`).
+//! 4x4x4 to 7x7x7: 40, 60, 80 and 100 random moves (see `nxn`).
 
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::thread;
 
 use rand::Rng;
 
-use crate::cube::{Cube, Move, SOLVED};
+use crate::cube::{self, Cube, Move, SOLVED};
+use crate::nxn;
+use crate::puzzle::Puzzle;
+use crate::twobytwo;
 use crate::twophase;
 
 /// TNoodle's limit for 3x3x3 scrambles.
@@ -27,23 +33,23 @@ fn scramble_for(state: &Cube) -> Vec<Move> {
     solution.iter().rev().map(|m| m.inverse()).collect()
 }
 
-fn format(moves: &[Move]) -> String {
-    moves
-        .iter()
-        .map(Move::to_string)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub fn generate() -> String {
-    generate_with(&mut rand::rng())
+/// A scramble for `puzzle`.
+pub fn generate_for(puzzle: Puzzle, rng: &mut impl Rng) -> String {
+    match puzzle {
+        Puzzle::Cube2 => twobytwo::generate_with(rng),
+        Puzzle::Cube3 => generate_with(rng),
+        big => {
+            let size = big.size();
+            nxn::format(&nxn::random_moves(size, nxn::scramble_length(size), rng))
+        }
+    }
 }
 
 pub fn generate_with(rng: &mut impl Rng) -> String {
     loop {
         let state = Cube::random(rng);
         if far_enough(&state) {
-            return format(&scramble_for(&state));
+            return cube::format(&scramble_for(&state));
         }
     }
 }
@@ -51,24 +57,32 @@ pub fn generate_with(rng: &mut impl Rng) -> String {
 /// Makes scrambles on a background thread, one ahead, so a new scramble is
 /// ready the moment a solve ends even when the search takes a while.
 pub struct Scrambler {
+    puzzle: Puzzle,
     next: Receiver<String>,
 }
 
 impl Scrambler {
-    pub fn new() -> Self {
+    pub fn new(puzzle: Puzzle) -> Self {
         let (tx, rx) = sync_channel(1);
         thread::spawn(move || {
             let mut rng = rand::rng();
             // Ends when the Scrambler is dropped and the send fails.
-            while tx.send(generate_with(&mut rng)).is_ok() {}
+            while tx.send(generate_for(puzzle, &mut rng)).is_ok() {}
         });
-        Self { next: rx }
+        Self { puzzle, next: rx }
+    }
+
+    #[cfg(test)]
+    pub fn puzzle(&self) -> Puzzle {
+        self.puzzle
     }
 
     /// The next scramble; waits only if the first one isn't ready yet.
     #[cfg(test)]
     pub fn next(&self) -> String {
-        self.next.recv().unwrap_or_else(|_| generate())
+        self.next
+            .recv()
+            .unwrap_or_else(|_| generate_for(self.puzzle, &mut rand::rng()))
     }
 
     /// The next scramble if it is ready, without waiting. If the worker thread
@@ -77,7 +91,7 @@ impl Scrambler {
         match self.next.try_recv() {
             Ok(s) => Some(s),
             Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(generate()),
+            Err(TryRecvError::Disconnected) => Some(generate_for(self.puzzle, &mut rand::rng())),
         }
     }
 }
@@ -97,7 +111,10 @@ mod tests {
             let moves = scramble_for(&state);
             assert_eq!(SOLVED.apply_all(&moves), state);
             // and survives the round trip through text
-            assert_eq!(SOLVED.apply_all(&parse(&format(&moves)).unwrap()), state);
+            assert_eq!(
+                SOLVED.apply_all(&parse(&cube::format(&moves)).unwrap()),
+                state
+            );
         }
     }
 
@@ -144,12 +161,13 @@ mod tests {
 
     #[test]
     fn scrambles_differ() {
-        assert_ne!(generate(), generate());
+        let mut rng = StdRng::seed_from_u64(43);
+        assert_ne!(generate_with(&mut rng), generate_with(&mut rng));
     }
 
     #[test]
     fn try_next_never_blocks_and_eventually_delivers() {
-        let s = Scrambler::new();
+        let s = Scrambler::new(Puzzle::Cube3);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let got = loop {
             if let Some(x) = s.try_next() {
@@ -163,13 +181,47 @@ mod tests {
 
     #[test]
     fn scrambler_hands_out_fresh_valid_scrambles() {
-        let s = Scrambler::new();
+        let s = Scrambler::new(Puzzle::Cube3);
         let a = s.next();
         let b = s.next();
         assert_ne!(a, b);
         for x in [a, b] {
             let moves = parse(&x).unwrap();
             assert!(!moves.is_empty() && moves.len() <= MAX_LENGTH);
+        }
+    }
+
+    #[test]
+    fn every_puzzle_gets_a_scramble_of_the_right_kind() {
+        let mut rng = StdRng::seed_from_u64(41);
+        for p in crate::puzzle::ALL {
+            for _ in 0..20 {
+                let text = generate_for(p, &mut rng);
+                let moves = nxn::parse(&text).unwrap_or_else(|| panic!("{p:?}: {text}"));
+                match p {
+                    Puzzle::Cube2 => assert!((4..=11).contains(&moves.len()), "{text}"),
+                    Puzzle::Cube3 => assert!((2..=MAX_LENGTH).contains(&moves.len()), "{text}"),
+                    big => assert_eq!(moves.len(), nxn::scramble_length(big.size()), "{text}"),
+                }
+                // wide turns appear only where the cube has them
+                let deepest = moves.iter().map(|m| m.layers).max().unwrap() as usize;
+                assert!(deepest <= (p.size() / 2).max(1), "{p:?} {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_scrambler_makes_scrambles_for_its_puzzle() {
+        for p in [Puzzle::Cube2, Puzzle::Cube5] {
+            let s = Scrambler::new(p);
+            assert_eq!(s.puzzle(), p);
+            let text = s.next();
+            let moves = nxn::parse(&text).unwrap();
+            if p == Puzzle::Cube5 {
+                assert_eq!(moves.len(), 60);
+            } else {
+                assert!(moves.len() <= 11);
+            }
         }
     }
 }
