@@ -160,7 +160,7 @@ green; the fallback renders without panicking at any size.
 terminals (images in four, half-blocks in Alacritty) and costs no timer accuracy. Suggested
 model: Opus for the spike and renderer, Sonnet for the view and controls.
 
-## Phase 4: CFOP algorithms and trainer — `feat/algs`
+## Phase 4: CFOP algorithms and trainer — `feat/algs` — done (merged into dev)
 
 **Goal:** look up any CFOP algorithm you forgot, watch it performed on the 3D cube, and
 drill the cases you are learning.

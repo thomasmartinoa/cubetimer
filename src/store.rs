@@ -3,6 +3,7 @@
 //! Sessions live in `<data dir>/cubetimer/sessions.json` and are written
 //! atomically (temp file, then rename).
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,10 @@ pub struct Solve {
     pub scramble: String,
     /// Unix timestamp in seconds.
     pub ts: u64,
+    /// The algorithm case a training solve was (`PLL:T`); none for normal
+    /// solves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case: Option<String>,
 }
 
 impl Solve {
@@ -34,6 +39,7 @@ impl Solve {
             penalty,
             scramble,
             ts,
+            case: None,
         }
     }
 
@@ -49,6 +55,10 @@ pub struct Session {
     /// have none, and those sessions are 3x3.
     #[serde(default = "default_puzzle_id")]
     pub puzzle: String,
+    /// For a trainer's session, the algorithm set it drills (`PLL`). Drill
+    /// sessions are kept apart from normal ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drill: Option<String>,
 }
 
 fn default_puzzle_id() -> String {
@@ -66,6 +76,7 @@ impl Session {
         Session {
             solves: Vec::new(),
             puzzle: puzzle.id().into(),
+            drill: None,
         }
     }
 
@@ -106,6 +117,10 @@ pub struct Data {
     pub current: usize,
     #[serde(default)]
     pub settings: Settings,
+    /// How far you are with each algorithm, by case key ("PLL:T" ->
+    /// "learning"). Cases you haven't marked aren't listed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub progress: BTreeMap<String, String>,
 }
 
 impl Default for Data {
@@ -114,6 +129,7 @@ impl Default for Data {
             sessions: vec![Session::default()],
             current: 0,
             settings: Settings::default(),
+            progress: BTreeMap::new(),
         }
     }
 }
@@ -140,8 +156,23 @@ impl Data {
     /// Indices of every session of `puzzle`, in order.
     pub fn sessions_of(&self, puzzle: Puzzle) -> Vec<usize> {
         (0..self.sessions.len())
-            .filter(|&i| self.sessions[i].puzzle() == puzzle)
+            .filter(|&i| self.sessions[i].puzzle() == puzzle && self.sessions[i].drill.is_none())
             .collect()
+    }
+
+    /// The drill session for algorithm set `set` (`PLL`), made if needed.
+    pub fn drill_session(&mut self, set: &str) -> usize {
+        if let Some(i) = self
+            .sessions
+            .iter()
+            .position(|s| s.drill.as_deref() == Some(set))
+        {
+            return i;
+        }
+        let mut s = Session::new(Puzzle::Cube3);
+        s.drill = Some(set.into());
+        self.sessions.push(s);
+        self.sessions.len() - 1
     }
 
     pub fn solves_mut(&mut self) -> &mut Vec<Solve> {
@@ -295,12 +326,14 @@ mod tests {
             penalty: Penalty::Plus2,
             scramble: "R U".into(),
             ts: 7,
+            case: None,
         });
         data.solves_mut().push(Solve {
             ms: 9_990,
             penalty: Penalty::Dnf,
             scramble: "F2".into(),
             ts: 8,
+            case: None,
         });
         data.sessions.push(Session::default());
         data.current = 1;
@@ -396,6 +429,7 @@ mod tests {
             penalty: Penalty::Ok,
             scramble: "a,\"b\"".into(),
             ts: 0,
+            case: None,
         });
         assert!(to_csv(&data).contains(",0.005,\"a,\"\"b\"\"\","));
     }
@@ -480,6 +514,7 @@ mod tests {
         data.sessions.push(Session {
             solves: vec![],
             puzzle: "from-the-future".into(),
+            drill: None,
         });
         save(&path, &data).unwrap();
         let back = read(&path).unwrap();
@@ -501,7 +536,34 @@ mod tests {
             penalty: Penalty::Ok,
             scramble: "Rw".into(),
             ts: 0,
+            case: None,
         });
         assert!(to_csv(&data).contains("\n2,4x4,1,50.000,ok,50.000,Rw,"));
+    }
+
+    #[test]
+    fn drill_sessions_are_separate_and_reused() {
+        let mut data = Data::default();
+        let pll = data.drill_session("PLL");
+        assert_eq!(pll, 1);
+        assert_eq!(data.drill_session("PLL"), 1, "the same one again");
+        assert_eq!(data.drill_session("OLL"), 2);
+        // normal session lists never include drills
+        assert_eq!(data.sessions_of(Puzzle::Cube3), vec![0]);
+        // and they survive saving, as does a solve's case
+        let dir = temp_dir("drill");
+        let path = dir.join("sessions.json");
+        data.current = pll;
+        let mut s = Solve::new(2_000, Penalty::Ok, "R U".into());
+        s.case = Some("PLL:T".into());
+        data.solves_mut().push(s);
+        save(&path, &data).unwrap();
+        let back = read(&path).unwrap();
+        assert_eq!(back.sessions[1].drill.as_deref(), Some("PLL"));
+        assert_eq!(back.sessions[1].solves[0].case.as_deref(), Some("PLL:T"));
+        // normal solves and sessions don't write the new fields at all
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("\"drill\"").count(), 2);
+        assert_eq!(text.matches("\"case\"").count(), 1);
     }
 }

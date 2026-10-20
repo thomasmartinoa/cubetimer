@@ -160,7 +160,13 @@ impl Nxn {
         let (axis, sign) = NORMALS[m.face as usize];
         let n = self.size as i16;
         // Layer k from the face (0 is outermost) has coordinate sign*(n-1-2k).
-        let lowest = (n - 1) - 2 * (m.layers as i16 - 1);
+        // Turning every layer is a whole-cube rotation, which also takes the
+        // stickers on the opposite face (at coordinate -n).
+        let lowest = if m.layers as usize >= self.size {
+            -n
+        } else {
+            (n - 1) - 2 * (m.layers as i16 - 1)
+        };
         for s in &mut self.stickers {
             let c = sign as i16 * s.pos[axis];
             // a face's own stickers sit on the surface, at coordinate n
@@ -196,6 +202,9 @@ impl Nxn {
         let n = self.size as f64;
         // back in doubled coordinates: layer k from the face is at n-1-2k
         let c = sign as f64 * center[axis] * n;
+        if m.layers as usize >= self.size {
+            return true;
+        }
         let lowest = (n - 1.0) - 2.0 * (m.layers as f64 - 1.0);
         c >= lowest - 0.5
     }
@@ -203,6 +212,24 @@ impl Nxn {
     /// The colors (0..6, U R F D L B) of all 6 N² stickers, face by face; each
     /// face is `size` rows of `size` columns as seen from outside with U above
     /// F: sticker `face * N² + row * N + column`.
+    /// A cube of `size` with the sticker colors `f`, in the layout of
+    /// `facelets`. Any color numbers are kept as they are, so a case can be
+    /// shown with stickers grayed out.
+    pub fn from_facelets(size: usize, f: &[u8]) -> Nxn {
+        let mut cube = Nxn::solved(size);
+        let n = size;
+        assert_eq!(f.len(), 6 * n * n);
+        for s in &mut cube.stickers {
+            let face = NORMALS
+                .iter()
+                .position(|&(a, sg)| s.normal[a] == sg)
+                .unwrap();
+            let (row, col) = net_position(face, s.pos, n);
+            s.color = f[face * n * n + row * n + col];
+        }
+        cube
+    }
+
     pub fn facelets(&self) -> Vec<u8> {
         let n = self.size;
         let mut out = vec![0u8; 6 * n * n];
@@ -555,5 +582,59 @@ mod tests {
                 assert_eq!(c.facelets().iter().filter(|&&x| x == color).count(), n * n);
             }
         }
+    }
+
+    #[test]
+    fn turning_every_layer_rotates_the_whole_cube() {
+        for n in 2..=7usize {
+            for face in 0..6u8 {
+                let whole = Move {
+                    face,
+                    layers: n as u8,
+                    turns: 1,
+                };
+                let mut c = Nxn::solved(n);
+                c.apply(whole);
+                // every face is still one color: nothing was left behind
+                let f = c.facelets();
+                for k in 0..6 {
+                    let face_stickers = &f[k * n * n..(k + 1) * n * n];
+                    assert!(
+                        face_stickers.iter().all(|&x| x == face_stickers[0]),
+                        "{n} {face}"
+                    );
+                }
+                assert!(!c.is_solved(), "but the colors moved");
+                for _ in 0..3 {
+                    c.apply(whole);
+                }
+                assert!(c.is_solved());
+            }
+        }
+    }
+
+    #[test]
+    fn a_cube_rebuilt_from_its_facelets_is_the_same() {
+        let mut rng = StdRng::seed_from_u64(26);
+        for n in 2..=7 {
+            let mut c = Nxn::solved(n);
+            c.apply_all(
+                &random_moves(n.max(4), 30, &mut rng)
+                    .into_iter()
+                    .filter(|m| (m.layers as usize) <= n / 2 || m.layers == 1)
+                    .collect::<Vec<_>>(),
+            );
+            let back = Nxn::from_facelets(n, &c.facelets());
+            assert_eq!(back.facelets(), c.facelets());
+            // and it turns the same way afterwards
+            let (mut a, mut b) = (c.clone(), back);
+            a.apply(m("R"));
+            b.apply(m("R"));
+            assert_eq!(a.facelets(), b.facelets());
+        }
+        // colors outside 0..6 (gray) survive
+        let mut f = Nxn::solved(3).facelets();
+        f[4] = 6;
+        assert_eq!(Nxn::from_facelets(3, &f).facelets()[4], 6);
     }
 }

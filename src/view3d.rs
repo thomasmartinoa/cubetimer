@@ -21,7 +21,7 @@ use ratatui_image::picker::{Capability, Picker, ProtocolType};
 use ratatui_image::protocol::kitty::StatefulKitty;
 use ratatui_image::protocol::{StatefulProtocol, StatefulProtocolType};
 
-use crate::anim::Player;
+use crate::anim::{Player, Step};
 use crate::nxn::{self, Nxn};
 use crate::render3d::{self, Camera, Turning};
 use crate::ui;
@@ -91,7 +91,6 @@ pub enum Mode {
 pub struct CubeView {
     /// Shown in the title: "3x3 scramble", "solve 18", ...
     pub title: String,
-    pub size: usize,
     pub player: Player,
     pub camera: Camera,
     pub mode: Mode,
@@ -110,7 +109,6 @@ impl CubeView {
         let moves = nxn::parse(scramble)?;
         Some(CubeView {
             title: title.into(),
-            size,
             player: Player::new(size, moves),
             camera: Camera::default(),
             mode: Mode::Cube3d,
@@ -118,6 +116,20 @@ impl CubeView {
             has_images: false,
             drag_from: None,
         })
+    }
+
+    /// A view of an algorithm on its case: the cube starts at `start` and
+    /// `space` plays the algorithm.
+    pub fn for_steps(title: impl Into<String>, start: Nxn, steps: Vec<Step>) -> CubeView {
+        CubeView {
+            title: title.into(),
+            player: Player::from_steps(start, steps, false),
+            camera: Camera::default(),
+            mode: Mode::Cube3d,
+            look: Look::default(),
+            has_images: false,
+            drag_from: None,
+        }
     }
 
     /// Whether the view needs redrawing on its own (a turn is animating).
@@ -215,9 +227,9 @@ pub struct Gfx {
 struct CacheKey {
     rect: Rect,
     camera: Camera,
-    pos: usize,
-    size: usize,
-    moves: usize,
+    /// What the cube looks like. (Not the player's position: two algorithms
+    /// of the same length at the same step are different cubes.)
+    stickers: Vec<u8>,
 }
 
 impl Gfx {
@@ -235,6 +247,10 @@ impl Gfx {
             return;
         }
         self.queried = true;
+        // only ask a real terminal (not tests, pipes or redirected output)
+        if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            return;
+        }
         let env = |k: &str| std::env::var(k).unwrap_or_default();
         let Some(protocol) = detect_protocol(
             &env("CUBETIMER_GRAPHICS"),
@@ -371,7 +387,15 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &CubeView, gfx: &Gfx) {
     let now = Instant::now();
     let (cube, turning) = view.player.frame(now);
     match view.mode {
-        Mode::Cube3d => draw_cube(frame, cube_area, view, &cube, turning, gfx),
+        Mode::Cube3d => draw_cube(
+            frame,
+            cube_area,
+            &cube,
+            turning,
+            view.camera,
+            view.look,
+            gfx,
+        ),
         Mode::Net => draw_net(frame, cube_area, &cube),
     }
     frame.render_widget(
@@ -412,10 +436,10 @@ fn moves_lines(view: &CubeView, _width: u16) -> Vec<Line<'static>> {
     let pos = view.player.pos();
     let playing = view.player.is_playing();
     let mut spans = vec![Span::styled(
-        format!("{}/{}  ", pos, view.player.moves().len()),
+        format!("{}/{}  ", pos, view.player.steps().len()),
         dim(),
     )];
-    for (i, m) in view.player.moves().iter().enumerate() {
+    for (i, step) in view.player.steps().iter().enumerate() {
         let style = if i < pos {
             dim()
         } else if i == pos && playing {
@@ -428,7 +452,7 @@ fn moves_lines(view: &CubeView, _width: u16) -> Vec<Line<'static>> {
         } else {
             Style::new()
         };
-        spans.push(Span::styled(m.to_string(), style));
+        spans.push(Span::styled(step.label.clone(), style));
         spans.push(Span::raw(" "));
     }
     vec![Line::from(spans)]
@@ -451,24 +475,28 @@ fn square_rect(area: Rect, cell_w: usize, cell_h: usize, max: usize) -> (Rect, u
     (r, r.width as usize * cell_w, r.height as usize * cell_h)
 }
 
-fn draw_cube(
+/// Draw `cube` in `area` in the given look: a real image where the terminal
+/// can show one, else half blocks or ASCII. Used by the 3D view and by the
+/// algorithm browser.
+pub fn draw_cube(
     frame: &mut Frame,
     area: Rect,
-    view: &CubeView,
     cube: &Nxn,
     turning: Option<Turning>,
+    camera: Camera,
+    look: Look,
     gfx: &Gfx,
 ) {
     if area.width < 2 || area.height < 2 {
         return;
     }
-    match view.look {
-        Look::Blocks => return draw_halfblocks(frame, area, view, cube, turning),
-        Look::Ascii | Look::Mono => return draw_ascii(frame, area, view, cube, turning),
+    match look {
+        Look::Blocks => return draw_halfblocks(frame, area, camera, cube, turning),
+        Look::Ascii | Look::Mono => return draw_ascii(frame, area, camera, look, cube, turning),
         Look::Image => {}
     }
     let Some(picker) = &gfx.picker else {
-        draw_halfblocks(frame, area, view, cube, turning);
+        draw_halfblocks(frame, area, camera, cube, turning);
         return;
     };
     let font = picker.font_size();
@@ -479,10 +507,8 @@ fn draw_cube(
     let (rect, pw, ph) = square_rect(area, font.width as usize, font.height as usize, max);
     let key = CacheKey {
         rect,
-        camera: view.camera,
-        pos: view.player.pos(),
-        size: view.size,
-        moves: view.player.moves().len(),
+        camera,
+        stickers: cube.facelets(),
     };
     let mut cache = gfx.cache.borrow_mut();
     // a still cube is drawn once; a turning one every frame, a little rougher
@@ -496,7 +522,7 @@ fn draw_cube(
             Some(_) if pw * ph > 700 * 700 => 1,
             Some(_) => 2,
         };
-        let img = render3d::render_with(cube, view.camera, turning, pw, ph, quality);
+        let img = render3d::render_with(cube, camera, turning, pw, ph, quality);
         let Some(rgba) = RgbaImage::from_raw(img.width as u32, img.height as u32, img.rgba) else {
             return;
         };
@@ -542,12 +568,12 @@ fn new_protocol(picker: &Picker, image: DynamicImage, frame: u64) -> StatefulPro
 fn draw_halfblocks(
     frame: &mut Frame,
     area: Rect,
-    view: &CubeView,
+    camera: Camera,
     cube: &Nxn,
     turning: Option<Turning>,
 ) {
     let (rect, pw, ph) = square_rect(area, 1, 2, MAX_PIXELS);
-    let img = render3d::render(cube, view.camera, turning, pw, ph);
+    let img = render3d::render(cube, camera, turning, pw, ph);
     let color = |x: usize, y: usize| {
         let p = img.pixel(x, y);
         (p[3] >= 128).then_some(Color::Rgb(p[0], p[1], p[2]))
@@ -661,7 +687,8 @@ fn ascii_cell(top: [u8; 4], bottom: [u8; 4], color: bool) -> Option<(char, Optio
 fn draw_ascii(
     frame: &mut Frame,
     area: Rect,
-    view: &CubeView,
+    camera: Camera,
+    look: Look,
     cube: &Nxn,
     turning: Option<Turning>,
 ) {
@@ -674,8 +701,8 @@ fn draw_ascii(
         zoom: TEXT_ZOOM,
         shade_range: TEXT_SHADE_RANGE,
     };
-    let img = render3d::render_opts(cube, view.camera, turning, pw, ph, opts);
-    let color = view.look == Look::Ascii;
+    let img = render3d::render_opts(cube, camera, turning, pw, ph, opts);
+    let color = look == Look::Ascii;
     let lines: Vec<Line> = (0..rect.height as usize)
         .map(|row| {
             let spans: Vec<Span> = (0..rect.width as usize)
@@ -1125,7 +1152,8 @@ mod tests {
                 .0
         };
         for light in [1.0, 0.8, 0.6, 0.45] {
-            let chars: Vec<char> = render3d::STICKER_RGB
+            // the six cube colors (not the gray of unimportant stickers)
+            let chars: Vec<char> = render3d::STICKER_RGB[..6]
                 .iter()
                 .map(|&c| lit(c, light))
                 .collect();

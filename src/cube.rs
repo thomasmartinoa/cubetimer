@@ -156,6 +156,22 @@ impl Cube {
         out
     }
 
+    /// The cube that undoes this one: `c.multiply(&c.inverse())` is solved.
+    pub fn inverse(&self) -> Cube {
+        let mut out = SOLVED;
+        for i in 0..8 {
+            let p = self.cp[i] as usize;
+            out.cp[p] = i as u8;
+            out.co[p] = (3 - self.co[i]) % 3;
+        }
+        for i in 0..12 {
+            let p = self.ep[i] as usize;
+            out.ep[p] = i as u8;
+            out.eo[p] = self.eo[i];
+        }
+        out
+    }
+
     pub fn apply(&self, m: Move) -> Cube {
         self.multiply(&m.cube())
     }
@@ -252,8 +268,7 @@ impl Cube {
 /// Stickers of each corner position, clockwise starting from the U or D
 /// sticker. Faces are numbered U R F D L B and each face's stickers 0..9 row
 /// by row, in the usual net: U above F, L F R B in a row, D below F.
-#[cfg(test)]
-const CORNER_FACELETS: [[usize; 3]; 8] = [
+pub const CORNER_FACELETS: [[usize; 3]; 8] = [
     [8, 9, 20],
     [6, 18, 38],
     [0, 36, 47],
@@ -263,8 +278,7 @@ const CORNER_FACELETS: [[usize; 3]; 8] = [
     [33, 53, 42],
     [35, 17, 51],
 ];
-#[cfg(test)]
-const EDGE_FACELETS: [[usize; 2]; 12] = [
+pub const EDGE_FACELETS: [[usize; 2]; 12] = [
     [5, 10],
     [7, 19],
     [3, 37],
@@ -279,7 +293,6 @@ const EDGE_FACELETS: [[usize; 2]; 12] = [
     [48, 14],
 ];
 /// The face colors of each corner and edge piece, in the same sticker order.
-#[cfg(test)]
 const CORNER_COLORS: [[u8; 3]; 8] = [
     [0, 1, 2],
     [0, 2, 4],
@@ -290,7 +303,6 @@ const CORNER_COLORS: [[u8; 3]; 8] = [
     [3, 5, 4],
     [3, 1, 5],
 ];
-#[cfg(test)]
 const EDGE_COLORS: [[u8; 2]; 12] = [
     [0, 1],
     [0, 2],
@@ -306,10 +318,39 @@ const EDGE_COLORS: [[u8; 2]; 12] = [
     [5, 1],
 ];
 
-/// Sticker view of the cube, kept as the reference the general N×N model in
+/// Sticker view of the cube. Also the reference the general N×N model in
 /// `nxn.rs` is tested against.
-#[cfg(test)]
 impl Cube {
+    /// The cube with these 54 sticker colors (in the layout of `facelets`),
+    /// or `None` if they don't describe a real cube (a missing or doubled
+    /// piece, or one that can't be reached by turning faces).
+    pub fn from_facelets(f: &[u8]) -> Option<Cube> {
+        if f.len() != 54 || (0..6).any(|face| f[face * 9 + 4] != face as u8) {
+            return None;
+        }
+        let mut c = SOLVED;
+        for (i, stickers) in CORNER_FACELETS.iter().enumerate() {
+            let s = stickers.map(|k| f[k]);
+            // the twist is where the U or D sticker is
+            let twist = s.iter().position(|&x| x == 0 || x == 3)?;
+            let colors = [s[twist], s[(twist + 1) % 3], s[(twist + 2) % 3]];
+            c.cp[i] = CORNER_COLORS.iter().position(|&p| p == colors)? as u8;
+            c.co[i] = twist as u8;
+        }
+        for (i, stickers) in EDGE_FACELETS.iter().enumerate() {
+            let s = stickers.map(|k| f[k]);
+            let (piece, flip) =
+                (0..12)
+                    .flat_map(|p| (0..2).map(move |fl| (p, fl)))
+                    .find(|&(p, fl)| {
+                        EDGE_COLORS[p][0] == s[fl] && EDGE_COLORS[p][1] == s[(fl + 1) % 2]
+                    })?;
+            c.ep[i] = piece as u8;
+            c.eo[i] = flip as u8;
+        }
+        c.is_solvable().then_some(c)
+    }
+
     /// The color (as a face number, U R F D L B) of all 54 stickers, face by
     /// face: sticker `9 * face + row * 3 + column`.
     pub fn facelets(&self) -> [u8; 54] {
@@ -669,5 +710,47 @@ mod tests {
                 assert_eq!(f[face as usize * 9 + k], want, "face {face} sticker {k}");
             }
         }
+    }
+
+    #[test]
+    fn stickers_convert_back_to_the_same_cube() {
+        let mut rng = StdRng::seed_from_u64(8);
+        for _ in 0..500 {
+            let c = Cube::random(&mut rng);
+            assert_eq!(Cube::from_facelets(&c.facelets()), Some(c));
+        }
+        assert_eq!(Cube::from_facelets(&SOLVED.facelets()), Some(SOLVED));
+    }
+
+    #[test]
+    fn impossible_stickers_are_rejected() {
+        let good = SOLVED.facelets();
+        // a twisted corner: swap two of its stickers' colors around
+        let mut f = good;
+        f.swap(CORNER_FACELETS[0][0], CORNER_FACELETS[0][1]);
+        assert_eq!(Cube::from_facelets(&f), None);
+        // a center out of place
+        let mut f = good;
+        f.swap(4, 13);
+        assert_eq!(Cube::from_facelets(&f), None);
+        // a missing piece (two of one edge)
+        let mut f = good;
+        f[EDGE_FACELETS[0][0]] = 0;
+        f[EDGE_FACELETS[0][1]] = 2;
+        assert_eq!(Cube::from_facelets(&f), None);
+        assert_eq!(Cube::from_facelets(&good[..53]), None);
+    }
+
+    #[test]
+    fn inverse_undoes_a_cube_both_ways() {
+        let mut rng = StdRng::seed_from_u64(10);
+        for _ in 0..500 {
+            let c = Cube::random(&mut rng);
+            assert_eq!(c.multiply(&c.inverse()), SOLVED);
+            assert_eq!(c.inverse().multiply(&c), SOLVED);
+            assert!(c.inverse().is_solvable());
+        }
+        let r = SOLVED.apply_all(&seq("R U F'"));
+        assert_eq!(r.inverse(), SOLVED.apply_all(&seq("F U' R'")));
     }
 }

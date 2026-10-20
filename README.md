@@ -32,6 +32,10 @@ already run.
   to look at every side, and press space to watch the scramble being done move by move.
   A real image in kitty, Ghostty, foot and WezTerm, half blocks elsewhere, or ASCII art in
   any terminal (`m` switches). See [The 3D view](#the-3d-view).
+- **CFOP algorithms.** `a` opens every PLL, OLL and F2L case (and the beginner 2-look
+  sets) as a diagram with a standard algorithm; watch any of them on the 3D cube, mark what
+  you are learning, and drill those cases with the trainer. See
+  [Algorithms and the trainer](#algorithms-and-the-trainer).
 - **Live stats.** Best, mean, mo3, ao5, ao12, ao100, best ao5 and best ao12. The average
   drops the best and worst 5% (at least one each) and a DNF counts as the worst result.
 - **Statistics.** Press `s` for a full-screen view: a time chart with rolling ao5 and ao12,
@@ -102,6 +106,8 @@ kitty --start-as=fullscreen cubetimer
 | `Backspace` | Delete the last solve (asks `y` / `n`) |
 | `h` | History: browse, mark and delete any solve |
 | `s` | Statistics: chart, distribution and summary (`r` or `1`-`4` change the range, `Esc` closes) |
+| `a` | Algorithms: PLL, OLL, F2L and 2-look, with the 3D cube and the trainer |
+| `t` | Stop training (while the trainer is on) |
 | `e` | Choose the puzzle: 2x2, 3x3, 4x4, 5x5, 6x6 or 7x7 (`2`-`7` jump straight to one) |
 | `v` | The scrambled cube in 3D (also from the history, for that solve) |
 | `n` | New session of the current puzzle (not while the current one is empty) |
@@ -194,6 +200,47 @@ plain (1 row)
 
 Run `cargo run --example fonts` to print them, or `cargo run --example fonts -- 1:02.34+`
 to try other text.
+
+## Algorithms and the trainer
+
+![the algorithm browser: every PLL case as a diagram, with progress marks, and the selected case's algorithm and cube](docs/screenshots/algs.png)
+
+`a` opens the algorithm browser. `Tab` moves between PLL (21 cases), OLL (57), F2L (41),
+2-look OLL and 2-look PLL; the arrows move between cases.
+
+| Key | Action |
+|---|---|
+| arrows or `h` `j` `k` `l` | Move between cases |
+| `Enter` or `v` | Show the case on the 3D cube; `space` there plays the algorithm |
+| `m` | Mark the case: learning, learned, or back to new (saved) |
+| `t` | Train this set |
+| `Tab` / `Shift-Tab` | Next / previous set |
+| `Esc` / `a` / `q` | Close |
+
+Cases are shown the way they are learned: yellow on top, green in front, so orange is on
+the right. OLL diagrams show only which stickers are yellow; F2L diagrams gray out the
+last layer so the pair stands out, with the front face and its slot below.
+
+**Trainer.** `t` in the browser drills the set: the cases you marked as learning, or all of
+them if you haven't marked any. Every case comes up equally often, with the top layer
+turned a random amount before and after it, and the rest of the last layer shuffled for OLL
+and F2L so you can't spot a case from its scramble. Scrambles are for the cube held the WCA
+way: scramble with white on top and green in front, turn it over (white cross down), and
+the case is on top as the browser draws it. After each solve the timer names the case and
+its algorithm. Training solves go into a separate session per set, tagged with their case,
+so they don't mix with your normal times, and the browser shows your count, mean and best
+for each case. `t` on the timer screen stops training.
+
+![the F2L trainer after a solve: "that was F2L 22" with its algorithm](docs/screenshots/trainer.png)
+
+**Where the algorithms come from.** Each is the first algorithm
+[SpeedCubeDB](https://www.speedcubedb.com/a/3x3) lists for the case. None is trusted on
+sight: the tests check every one against the cube model. Every PLL must only permute the
+last layer and every OLL keep the first two layers, and each set must solve every case
+exactly once: the 288 possible last-layer permutations fall into the 21 PLLs, the 216
+orientation patterns into the 57 OLLs, and the 150 places the front-right pair can be into
+the 41 F2L cases. The case each diagram shows is computed from its algorithm, so a picture
+can't disagree with the algorithm under it.
 
 ## The 3D view
 
@@ -311,6 +358,8 @@ The first line should say `keyboard enhancement: ON`.
 ## Limitations
 
 - Cubes only: no Pyraminx, Skewb, Megaminx, Clock or Square-1.
+- One algorithm per case, and only CFOP (no ZBLL, COLL or other methods). The trainer
+  assumes a white cross and a yellow last layer.
 - 4x4 scrambles are random-move, not random-state.
 - No import from csTimer or other timers (export to CSV is supported), no session names,
   and no Bluetooth smart cubes.
@@ -333,8 +382,9 @@ solver), `nxn.rs` (cubes of any size as stickers in space), `twobytwo.rs` (the 2
 table), `puzzle.rs`, `scramble.rs`, `fmt.rs` (time formatting), `stats.rs` (averages), `font.rs`
 (digit fonts), `store.rs` (sessions on disk), `app.rs` (state machine), `ui.rs`
 (drawing), `render3d.rs` (the 3D renderer), `anim.rs` (playing moves), `view3d.rs` (the 3D
-view), `chart.rs` (axis ticks, outliers, histograms) and `statsview.rs` (the statistics
-screen and the chart). `term.rs` owns raw mode and the keyboard protocol, and restores the terminal on
+view), `chart.rs` (axis ticks, outliers, histograms), `statsview.rs` (the statistics
+screen and the chart), `alg.rs` (algorithm notation), `algs.rs` (the algorithm library and
+its checks), `algview.rs` (the browser) and `trainer.rs`. `term.rs` owns raw mode and the keyboard protocol, and restores the terminal on
 exit, on panic and on signals.
 
 ## License

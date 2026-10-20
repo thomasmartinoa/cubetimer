@@ -174,6 +174,35 @@ except Exception as e:
     saved = f"unreadable: {e}"
 check("the chosen look is saved", saved == "ascii", saved)
 
+# The algorithm browser (a), a case on the 3D cube (enter), and the trainer
+# (t): its scrambles come in and a solve is saved tagged with its case.
+pid8, fd8 = spawn("xterm-256color")
+pump(fd8, 2.5)
+os.write(fd8, b"a")
+check("a opens the algorithm browser", "algorithms" in text(pump(fd8, 0.8)))
+os.write(fd8, b"\r")
+check("enter shows the case on the 3D cube", "Aa-perm" in text(pump(fd8, 1.0)))
+os.write(fd8, b"\x1b")
+pump(fd8, 0.4)
+os.write(fd8, b"t")
+trained = text(pump(fd8, 2.0))
+check("t starts the PLL trainer", "PLL trainer" in trained)
+os.write(fd8, b"i")  # inspection off, so space starts the clock (basic mode)
+pump(fd8, 0.3)
+os.write(fd8, b" ")
+pump(fd8, 0.6)
+os.write(fd8, b" ")
+check("after a training solve it names the case", "that was" in text(pump(fd8, 0.8)))
+os.write(fd8, b"q")
+check("q quits from the trainer", wait_exit(pid8) == 0)
+try:
+    sessions = json.load(open(os.path.join(DATA, "cubetimer", "sessions.json")))["sessions"]
+    drill = [x for x in sessions if x.get("drill") == "PLL"]
+    tagged = drill and drill[0]["solves"] and drill[0]["solves"][-1].get("case", "").startswith("PLL:")
+except Exception as e:
+    tagged = False
+check("the training solve is saved with its case", bool(tagged))
+
 # Mouse: reporting is on only while the cube view is open, and a drag turns
 # the cube (SGR mouse sequences, as kitty, foot, Ghostty and WezTerm send).
 pid6, fd6 = spawn()

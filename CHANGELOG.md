@@ -19,6 +19,13 @@
   kitty, Ghostty, foot and WezTerm, with half blocks elsewhere.
 - The 3D view can be drawn as colored ASCII art or mono ASCII (`m` cycles image, half
   blocks, ASCII, mono; the choice is saved), which works in every terminal.
+- CFOP algorithms (`a`): all 21 PLL, 57 OLL and 41 F2L cases plus the 2-look sets, each
+  drawn as a diagram computed from its algorithm, playable on the 3D cube, with progress
+  marks. Every algorithm is checked against the cube model, and each set must solve every
+  case exactly once.
+- A trainer for any set: scrambles that set up the cases you are learning (uniformly, with
+  random top-layer turns), solves tagged with their case in a separate session, and your
+  count, mean and best per case in the browser.
 - Building from source now needs Rust 1.90 (a dependency of the image support requires it).
 
 ## 0.1.0

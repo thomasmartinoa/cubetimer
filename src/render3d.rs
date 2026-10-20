@@ -12,15 +12,18 @@
 
 use crate::nxn::{Move, Nxn};
 
-/// WCA colors, U R F D L B (the same as the flat preview).
-pub const STICKER_RGB: [[u8; 3]; 6] = [
+/// WCA colors, U R F D L B (the same as the flat preview), and `GRAY` for
+/// stickers that don't matter (an algorithm case shows only what it is about).
+pub const STICKER_RGB: [[u8; 3]; 7] = [
     [245, 245, 245],
     [214, 40, 40],
     [0, 168, 84],
     [255, 213, 0],
     [255, 128, 0],
     [0, 82, 204],
+    [92, 92, 92],
 ];
+pub const GRAY: u8 = 6;
 const PLASTIC: [u8; 3] = [18, 18, 18];
 
 /// Which way the cube is seen. The default shows U, F and R, like a cube held
@@ -59,6 +62,20 @@ impl Camera {
 pub struct Turning {
     pub m: Move,
     pub fraction: f64,
+    /// Layers of `m` that stay still: for a slice move (`M` turns like
+    /// `Lw` without `L`), the outer layer.
+    pub except: Option<Move>,
+}
+
+impl Turning {
+    #[cfg(test)]
+    pub fn new(m: Move, fraction: f64) -> Turning {
+        Turning {
+            m,
+            fraction,
+            except: None,
+        }
+    }
 }
 
 /// An RGBA image, row by row.
@@ -270,12 +287,17 @@ pub fn render_opts(
     let spin = turning.map(|t| {
         // a clockwise turn seen from the face is negative about its outward axis
         let deg = -90.0 * t.m.turns as f64 * t.fraction * t.m.sign() as f64;
-        (t.m, deg)
+        (t.m, deg, t.except)
     });
     // a point of a sticker in a turning layer turns with it
     let turn_of = |center: V3| -> Option<(usize, f64)> {
         match spin {
-            Some((m, deg)) if cube.in_layers(m, center) => Some((m.axis(), deg)),
+            Some((m, deg, except))
+                if cube.in_layers(m, center)
+                    && !except.is_some_and(|e| cube.in_layers(e, center)) =>
+            {
+                Some((m.axis(), deg))
+            }
             _ => None,
         }
     };
@@ -323,24 +345,34 @@ pub fn render_opts(
             bias: 0.0,
         });
     }
-    // the cut between the turning layers and the rest, as black squares
-    if let Some((m, deg)) = spin {
-        let layers = m.layers as f64;
-        let depth = 1.0 - layers * cell; // where the cut is, from the center
+    // The cuts between the turning layers and the rest, as black squares: the
+    // inner side of the turning block, and for a slice its outer side too. A
+    // whole-cube rotation has none.
+    if let Some((m, deg, except)) = spin {
         let mut axis_dir = [0.0; 3];
         axis_dir[m.axis()] = m.sign() as f64;
-        let cut = scale(axis_dir, depth);
-        for (rot, flip) in [(deg, 1.0), (0.0, -1.0)] {
-            // the square is built unturned, then turned with its layer
-            let corners: Vec<V3> = square(cut, scale(axis_dir, -flip), 1.0)
-                .iter()
-                .map(|&p| to_view(rotate(p, m.axis(), rot), camera))
-                .collect();
-            quads.push(Quad {
-                corners,
-                color: PLASTIC,
-                bias: 0.002,
-            });
+        // (layers counted from the face, which side the turning block is on)
+        let mut cuts = vec![];
+        if (m.layers as usize) < cube.size() {
+            cuts.push((m.layers as f64, 1.0));
+        }
+        if let Some(e) = except {
+            cuts.push((e.layers as f64, -1.0));
+        }
+        for (layers, side) in cuts {
+            let cut = scale(axis_dir, 1.0 - layers * cell);
+            // one face of the cut turns with the block, the other stays
+            for (rot, flip) in [(deg, side), (0.0, -side)] {
+                let corners: Vec<V3> = square(cut, scale(axis_dir, -flip), 1.0)
+                    .iter()
+                    .map(|&p| to_view(rotate(p, m.axis(), rot), camera))
+                    .collect();
+                quads.push(Quad {
+                    corners,
+                    color: PLASTIC,
+                    bias: 0.002,
+                });
+            }
         }
     }
 
@@ -735,10 +767,10 @@ mod tests {
         let cube = Nxn::solved(3);
         let cam = Camera::default();
         let m = nxn::parse("U").unwrap()[0];
-        let start = render(&cube, cam, Some(Turning { m, fraction: 0.0 }), W, H);
+        let start = render(&cube, cam, Some(Turning::new(m, 0.0)), W, H);
         let still = render(&cube, cam, None, W, H);
         assert_eq!(start, still, "no rotation at 0");
-        let mid = render(&cube, cam, Some(Turning { m, fraction: 0.5 }), W, H);
+        let mid = render(&cube, cam, Some(Turning::new(m, 0.5)), W, H);
         assert_ne!(mid, still);
         // the bottom of the cube (not turning) is unchanged at the F center row
         let below = sticker_pixel(3, cam, 2, 2, 1, W, H).unwrap();
@@ -752,13 +784,7 @@ mod tests {
         let cam = Camera::default();
         for mv in ["R", "U'", "F2", "Rw"] {
             let m = nxn::parse(mv).unwrap()[0];
-            let animated = render(
-                &Nxn::solved(4),
-                cam,
-                Some(Turning { m, fraction: 1.0 }),
-                W,
-                H,
-            );
+            let animated = render(&Nxn::solved(4), cam, Some(Turning::new(m, 1.0)), W, H);
             let applied = render(&cube_after(4, mv), cam, None, W, H);
             // the same picture, give or take anti-aliasing along the edges
             let differ = animated
@@ -857,10 +883,7 @@ mod tests {
                     },
                 ] {
                     for k in 1..8 {
-                        let turning = Some(Turning {
-                            m,
-                            fraction: k as f64 / 8.0,
-                        });
+                        let turning = Some(Turning::new(m, k as f64 / 8.0));
                         let img = render(&Nxn::solved(size), cam, turning, 160, 160);
                         assert_eq!(holes(&img), 0, "{size}x{size} {mv} at {k}/8, {cam:?}");
                     }
@@ -877,7 +900,7 @@ mod tests {
         let img = render(
             &Nxn::solved(3),
             Camera::default(),
-            Some(Turning { m, fraction: 0.5 }),
+            Some(Turning::new(m, 0.5)),
             300,
             300,
         );
