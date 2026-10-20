@@ -17,6 +17,8 @@
 - A 3D view of the scrambled cube (`v`, also from the history): drag it or use the arrows
   to turn it, and play the scramble move by move with animated turns. Drawn as an image in
   kitty, Ghostty, foot and WezTerm, with half blocks elsewhere.
+- The 3D view can be drawn as colored ASCII art or mono ASCII (`m` cycles image, half
+  blocks, ASCII, mono; the choice is saved), which works in every terminal.
 - Building from source now needs Rust 1.90 (a dependency of the image support requires it).
 
 ## 0.1.0

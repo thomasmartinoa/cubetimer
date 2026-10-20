@@ -82,6 +82,8 @@ pub struct Settings {
     pub font: String,
     pub inspection: bool,
     pub bell: bool,
+    /// How the 3D cube is drawn, see `view3d::Look`.
+    pub look: String,
 }
 
 impl Default for Settings {
@@ -90,6 +92,7 @@ impl Default for Settings {
             font: crate::font::DEFAULT.into(),
             inspection: true,
             bell: false,
+            look: crate::view3d::Look::default().name().into(),
         }
     }
 }
@@ -342,12 +345,17 @@ mod tests {
             (s.font.as_str(), s.inspection, s.bell),
             ("pixel", true, false)
         );
+        assert_eq!(
+            s.look, "image",
+            "a file from before looks existed gets the default"
+        );
 
         let mut data = sample();
         data.settings = Settings {
             font: "plain".into(),
             inspection: false,
             bell: true,
+            look: "ascii".into(),
         };
         save(&path, &data).unwrap();
         assert_eq!(load(&path).data.settings, data.settings);

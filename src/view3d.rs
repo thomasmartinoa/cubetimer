@@ -34,6 +34,52 @@ const TURN_DEGREES: f64 = 15.0;
 const MAX_PIXELS: usize = 1200;
 const MAX_PIXELS_SIXEL: usize = 900;
 
+/// How the cube is drawn. `m` cycles through them; the choice is saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Look {
+    /// A real image where the terminal can show one, else `Blocks`.
+    #[default]
+    Image,
+    /// Half-block characters: colored pixels, two per cell.
+    Blocks,
+    /// ASCII characters in the stickers' colors; the character's density
+    /// carries the shading, like the classic spinning ASCII donut.
+    Ascii,
+    /// The same ASCII art without any color.
+    Mono,
+}
+
+impl Look {
+    pub const ALL: [Look; 4] = [Look::Image, Look::Blocks, Look::Ascii, Look::Mono];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Look::Image => "image",
+            Look::Blocks => "blocks",
+            Look::Ascii => "ascii",
+            Look::Mono => "mono",
+        }
+    }
+
+    /// The look called `name`; anything else (a typo, a file from a newer
+    /// version) is the default.
+    pub fn from_name(name: &str) -> Look {
+        Look::ALL
+            .into_iter()
+            .find(|l| l.name() == name)
+            .unwrap_or_default()
+    }
+
+    /// The next look, skipping `Image` when the terminal can't show images.
+    pub fn next(self, has_images: bool) -> Look {
+        let i = Look::ALL.iter().position(|&l| l == self).unwrap_or(0);
+        (1..=Look::ALL.len())
+            .map(|k| Look::ALL[(i + k) % Look::ALL.len()])
+            .find(|&l| l != Look::Image || has_images)
+            .unwrap_or(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Cube3d,
@@ -49,6 +95,10 @@ pub struct CubeView {
     pub player: Player,
     pub camera: Camera,
     pub mode: Mode,
+    pub look: Look,
+    /// Whether the terminal can show images (set by the app from `Gfx`), so
+    /// cycling the look knows whether `Image` is a real choice.
+    pub has_images: bool,
     /// Where a mouse drag last was, while one is in progress.
     drag_from: Option<(u16, u16)>,
 }
@@ -64,6 +114,8 @@ impl CubeView {
             player: Player::new(size, moves),
             camera: Camera::default(),
             mode: Mode::Cube3d,
+            look: Look::default(),
+            has_images: false,
             drag_from: None,
         })
     }
@@ -94,6 +146,7 @@ impl CubeView {
                 self.camera = turn(self.camera, 0.0, TURN_DEGREES)
             }
             KeyCode::Char('r') => self.camera = Camera::default(),
+            KeyCode::Char('m') => self.look = self.look.next(self.has_images),
             KeyCode::Char(' ') => self.player.toggle(now),
             KeyCode::Char('.') => self.player.step(true),
             KeyCode::Char(',') => self.player.step(false),
@@ -199,6 +252,11 @@ impl Gfx {
         let mut picker = Picker::from_fontsize(font);
         picker.set_protocol_type(protocol);
         self.picker = Some(picker);
+    }
+
+    /// Whether the terminal shows real images (not just half blocks).
+    pub fn has_images(&self) -> bool {
+        self.picker.is_some()
     }
 
     /// The protocol in use, for the footer.
@@ -337,7 +395,13 @@ fn footer(view: &CubeView, gfx: &Gfx) -> Vec<Span<'static>> {
         view.player.speed_ms()
     );
     if view.mode == Mode::Cube3d {
-        text.push_str(&format!("[{}] ", gfx.protocol_name()));
+        let how = match view.look {
+            Look::Image => gfx.protocol_name(),
+            Look::Blocks => "half blocks",
+            Look::Ascii => "ascii",
+            Look::Mono => "mono ascii",
+        };
+        text.push_str(&format!("[m: {how}] "));
     }
     vec![Span::styled(text, dim())]
 }
@@ -397,6 +461,11 @@ fn draw_cube(
 ) {
     if area.width < 2 || area.height < 2 {
         return;
+    }
+    match view.look {
+        Look::Blocks => return draw_halfblocks(frame, area, view, cube, turning),
+        Look::Ascii | Look::Mono => return draw_ascii(frame, area, view, cube, turning),
+        Look::Image => {}
     }
     let Some(picker) = &gfx.picker else {
         draw_halfblocks(frame, area, view, cube, turning);
@@ -493,6 +562,129 @@ fn draw_halfblocks(
                     (Some(top), None) => Span::styled("\u{2580}", Style::new().fg(top)),
                     (None, Some(bottom)) => Span::styled("\u{2584}", Style::new().fg(bottom)),
                     (None, None) => Span::raw(" "),
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), rect);
+}
+
+/// How much of its square a sticker fills in the text looks.
+const TEXT_FILL: f64 = 0.8;
+/// Lighting contrast for the text looks. The character is chosen from it, so
+/// the three visible faces of a cube get clearly different densities.
+const TEXT_SHADE_RANGE: f64 = 0.55;
+
+/// How much the text looks are zoomed in. At the default view the cube just
+/// fits at 1.4 and touches the edge at 1.5; turned to other angles a corner
+/// can clip a little.
+const TEXT_ZOOM: f64 = 1.35;
+
+/// Characters from sparse to dense. Sticker brightness picks the character.
+const RAMP: &[u8] = b":-=+*#%@";
+/// Pixels darker than this (by luminance) are the cube's black plastic
+/// (luma 18). The dimmest sticker, blue at the lowest lighting, is about 32.
+const PLASTIC_LUMA: f64 = 26.0;
+/// The lighting range that maps onto `RAMP`: a face turned fully away from
+/// the light (1 - `TEXT_SHADE_RANGE`) up to a face lit straight on (1.0).
+const RAMP_FROM: f64 = 1.0 - TEXT_SHADE_RANGE;
+const RAMP_TO: f64 = 1.0;
+
+/// How brightly lit a sticker pixel is: its brightest channel against the
+/// brightest channel of the sticker color it is closest to, 0 to 1.
+fn lighting(rgb: [f64; 3]) -> f64 {
+    let peak = rgb.iter().cloned().fold(1.0, f64::max);
+    let direction = |c: [f64; 3]| {
+        let len = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt().max(1.0);
+        [c[0] / len, c[1] / len, c[2] / len]
+    };
+    let d = direction(rgb);
+    let base = render3d::STICKER_RGB
+        .iter()
+        .map(|&c| c.map(f64::from))
+        .min_by(|a, b| {
+            let dist = |c: &[f64; 3]| {
+                let e = direction(*c);
+                (0..3).map(|k| (e[k] - d[k]).powi(2)).sum::<f64>()
+            };
+            dist(a).total_cmp(&dist(b))
+        })
+        .unwrap_or([255.0; 3]);
+    let base_peak = base.iter().cloned().fold(1.0, f64::max);
+    (peak / base_peak).clamp(0.0, 1.0)
+}
+
+/// The brightness of a pixel, 0 to 255.
+fn luma(p: [u8; 4]) -> f64 {
+    0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64
+}
+
+/// One cell of ASCII art for a pixel pair (the two halves of the cell):
+/// the character and its color (`None` for no color), or `None` for empty.
+///
+/// A cell is either black plastic or a sticker, never a blend: blending the
+/// anti-aliased pixels along every sticker edge makes in-between characters
+/// that read as noise. A cell where plastic meets a sticker is plastic, which
+/// also keeps the gaps between stickers visible at this coarse resolution.
+fn ascii_cell(top: [u8; 4], bottom: [u8; 4], color: bool) -> Option<(char, Option<Color>)> {
+    let solid = |p: [u8; 4]| p[3] >= 128;
+    let (top_in, bottom_in) = (solid(top), solid(bottom));
+    if !top_in && !bottom_in {
+        return None;
+    }
+    let plastic = Some(('.', color.then_some(Color::Indexed(240))));
+    let pixels: Vec<[u8; 4]> = [top, bottom].into_iter().filter(|&p| solid(p)).collect();
+    if pixels.iter().any(|&p| luma(p) < PLASTIC_LUMA) {
+        return plastic;
+    }
+    // what is left is sticker (one half, or both of the same sticker)
+    let n = pixels.len() as f64;
+    let rgb = [0, 1, 2].map(|k| pixels.iter().map(|p| p[k] as f64).sum::<f64>() / n);
+    let t = ((lighting(rgb) - RAMP_FROM) / (RAMP_TO - RAMP_FROM)).clamp(0.0, 1.0);
+    let ch = RAMP[(t * (RAMP.len() - 1) as f64).round() as usize] as char;
+    // the character carries the brightness, so show the hue at full strength
+    let peak = rgb.iter().cloned().fold(1.0, f64::max);
+    let fg = color.then(|| {
+        let scale = 255.0 / peak;
+        Color::Rgb(
+            (rgb[0] * scale).round() as u8,
+            (rgb[1] * scale).round() as u8,
+            (rgb[2] * scale).round() as u8,
+        )
+    });
+    Some((ch, fg))
+}
+
+/// The cube as ASCII art: each cell is two pixels stacked, as with half
+/// blocks, but drawn with a character whose density shows the shading.
+fn draw_ascii(
+    frame: &mut Frame,
+    area: Rect,
+    view: &CubeView,
+    cube: &Nxn,
+    turning: Option<Turning>,
+) {
+    let (rect, pw, ph) = square_rect(area, 1, 2, MAX_PIXELS);
+    // Text is coarse: zoomed in to fill the window, with wide gaps and little
+    // smoothing, so the cells read as a grid of squares.
+    let opts = render3d::Options {
+        ss: 2,
+        sticker_fill: TEXT_FILL,
+        zoom: TEXT_ZOOM,
+        shade_range: TEXT_SHADE_RANGE,
+    };
+    let img = render3d::render_opts(cube, view.camera, turning, pw, ph, opts);
+    let color = view.look == Look::Ascii;
+    let lines: Vec<Line> = (0..rect.height as usize)
+        .map(|row| {
+            let spans: Vec<Span> = (0..rect.width as usize)
+                .map(|x| {
+                    match ascii_cell(img.pixel(x, 2 * row), img.pixel(x, 2 * row + 1), color) {
+                        Some((ch, Some(fg))) => Span::styled(ch.to_string(), Style::new().fg(fg)),
+                        Some((ch, None)) => Span::raw(ch.to_string()),
+                        None => Span::raw(" "),
+                    }
                 })
                 .collect();
             Line::from(spans)
@@ -726,5 +918,266 @@ mod tests {
         v.mouse(MouseEventKind::Down(MouseButton::Right), 0, 0);
         v.mouse(MouseEventKind::Drag(MouseButton::Right), 9, 9);
         assert_eq!(v.camera, after);
+    }
+
+    #[test]
+    fn looks_have_unique_names_that_round_trip() {
+        for l in Look::ALL {
+            assert_eq!(Look::from_name(l.name()), l);
+        }
+        assert!(
+            Look::ALL
+                .iter()
+                .enumerate()
+                .all(|(i, a)| Look::ALL[..i].iter().all(|b| a.name() != b.name()))
+        );
+        assert_eq!(Look::from_name("from-the-future"), Look::default());
+        assert_eq!(Look::from_name(""), Look::default());
+        assert_eq!(Look::default(), Look::Image);
+    }
+
+    #[test]
+    fn cycling_the_look_visits_every_style_and_skips_images_when_unavailable() {
+        let mut seen = vec![];
+        let mut l = Look::Image;
+        for _ in 0..4 {
+            seen.push(l);
+            l = l.next(true);
+        }
+        assert_eq!(seen, Look::ALL.to_vec());
+        assert_eq!(l, Look::Image, "wraps around");
+        // no images: Blocks -> Ascii -> Mono -> Blocks, never Image
+        let mut l = Look::Blocks;
+        for want in [Look::Ascii, Look::Mono, Look::Blocks, Look::Ascii] {
+            l = l.next(false);
+            assert_eq!(l, want);
+        }
+        // a saved Image look on a terminal without images moves on cleanly
+        assert_eq!(Look::Image.next(false), Look::Blocks);
+    }
+
+    fn ascii_view(look: Look, scramble: &str) -> CubeView {
+        let mut v = view(scramble);
+        v.look = look;
+        v
+    }
+
+    #[test]
+    fn m_cycles_the_look() {
+        let t = Instant::now();
+        let mut v = view("R U");
+        v.has_images = true;
+        v.key(KeyCode::Char('m'), t);
+        assert_eq!(v.look, Look::Blocks);
+        v.key(KeyCode::Char('m'), t);
+        assert_eq!(v.look, Look::Ascii);
+        v.key(KeyCode::Char('m'), t);
+        v.key(KeyCode::Char('m'), t);
+        assert_eq!(v.look, Look::Image);
+        v.has_images = false;
+        v.look = Look::Mono;
+        v.key(KeyCode::Char('m'), t);
+        assert_eq!(v.look, Look::Blocks, "no image step when none can be shown");
+    }
+
+    #[test]
+    fn ascii_cells_are_characters_with_density_for_shading() {
+        let px = |r, g, b| [r, g, b, 255];
+        // empty space and the edges of the cube
+        assert_eq!(ascii_cell([0; 4], [0; 4], true), None);
+        assert_eq!(
+            ascii_cell([200, 0, 0, 30], [200, 0, 0, 30], true),
+            None,
+            "mostly empty"
+        );
+        // black plastic is a dim dot
+        assert_eq!(
+            ascii_cell(px(18, 18, 18), px(18, 18, 18), true),
+            Some(('.', Some(Color::Indexed(240))))
+        );
+        assert_eq!(
+            ascii_cell(px(18, 18, 18), px(18, 18, 18), false),
+            Some(('.', None))
+        );
+        // brighter stickers use denser characters
+        let rank = |c: char| RAMP.iter().position(|&b| b as char == c).unwrap();
+        let white = ascii_cell(px(245, 245, 245), px(245, 245, 245), true)
+            .unwrap()
+            .0;
+        let shaded = ascii_cell(px(160, 160, 160), px(160, 160, 160), true)
+            .unwrap()
+            .0;
+        let dark = ascii_cell(px(70, 70, 70), px(70, 70, 70), true).unwrap().0;
+        assert!(
+            rank(white) > rank(shaded) && rank(shaded) > rank(dark),
+            "{white} {shaded} {dark}"
+        );
+        assert_eq!(white, '@');
+    }
+
+    #[test]
+    fn ascii_color_keeps_the_hue_at_full_strength() {
+        let red = ascii_cell([140, 20, 20, 255], [140, 20, 20, 255], true)
+            .unwrap()
+            .1
+            .unwrap();
+        assert_eq!(red, Color::Rgb(255, 36, 36));
+        let blue = ascii_cell([0, 60, 150, 255], [0, 60, 150, 255], true)
+            .unwrap()
+            .1
+            .unwrap();
+        assert_eq!(blue, Color::Rgb(0, 102, 255));
+        // two pixels of different coverage mix by how much of the cell they fill
+        let edge = ascii_cell([200, 0, 0, 255], [0, 0, 200, 40], true)
+            .unwrap()
+            .1
+            .unwrap();
+        let Color::Rgb(r, _, b) = edge else { panic!() };
+        assert!(r > 200 && b < 100, "mostly the opaque pixel: {edge:?}");
+    }
+
+    #[test]
+    fn the_ascii_cube_is_drawn_in_text_without_blocks_or_images() {
+        let v = ascii_view(Look::Ascii, "R U R' U'");
+        let (text, buf) = render(&v, 100, 40);
+        assert!(text.contains("[m: ascii]"), "{text}");
+        assert!(!text.contains('\u{2580}') && !text.contains('\u{2584}'));
+        // plastic dots, and at least three different densities for the three
+        // visible faces
+        assert!(text.contains('.'));
+        let densities = RAMP.iter().filter(|&&b| text.contains(b as char)).count();
+        assert!(densities >= 3, "{densities} densities");
+        // sticker characters carry their color
+        let colored = (0..40u16)
+            .flat_map(|y| (0..100u16).map(move |x| (x, y)))
+            .filter(|&(x, y)| matches!(buf[(x, y)].style().fg, Some(Color::Rgb(..))))
+            .count();
+        assert!(colored > 300, "{colored}");
+        // the corners of the view are empty
+        assert_eq!(buf[(2, 2)].symbol(), " ");
+    }
+
+    #[test]
+    fn mono_has_no_color_at_all_and_still_shows_the_cube() {
+        let v = ascii_view(Look::Mono, "R U R' U'");
+        let (text, buf) = render(&v, 100, 40);
+        assert!(text.contains("[m: mono ascii]"));
+        let colored = (0..40u16)
+            .flat_map(|y| (0..100u16).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let fg = buf[(x, y)].style().fg;
+                matches!(fg, Some(Color::Rgb(..) | Color::Indexed(_)))
+            })
+            .count();
+        // only the title and footer (outside the cube) use the default colors too
+        assert_eq!(colored, 0);
+        let art: usize = text.chars().filter(|c| ":-=+*#%@".contains(*c)).count();
+        assert!(art > 250, "{art}");
+    }
+
+    #[test]
+    fn the_ascii_cube_shows_its_stickers_as_a_grid() {
+        // a solved 3x3 seen head on has 9 stickers per face; the plastic
+        // between them must show as '.' so the grid reads
+        let mut v = ascii_view(Look::Mono, "");
+        v.camera = Camera {
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        let (text, _) = render(&v, 100, 50);
+        let dots = text.chars().filter(|&c| c == '.').count();
+        assert!(dots > 80, "{dots}");
+    }
+
+    #[test]
+    fn the_ascii_cube_turns_animates_and_plays() {
+        let t = Instant::now();
+        let mut v = ascii_view(Look::Ascii, "R U F");
+        let (before, _) = render(&v, 100, 40);
+        v.key(KeyCode::Left, t);
+        let (turned, _) = render(&v, 100, 40);
+        assert_ne!(before, turned);
+        v.key(KeyCode::Char(' '), t);
+        let (playing, _) = render(&v, 100, 40);
+        assert!(playing.contains("pause"));
+    }
+
+    #[test]
+    fn every_look_renders_at_every_size_and_window() {
+        for look in Look::ALL {
+            for size in 2..=7 {
+                let mut v = CubeView::new("x", size, "R U").unwrap();
+                v.look = look;
+                for (w, h) in [(1, 1), (5, 3), (30, 10), (80, 24), (200, 60)] {
+                    render(&v, w, h);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_character_follows_the_lighting_not_the_color() {
+        // the same lighting on different colors gives the same character
+        let lit = |base: [u8; 3], light: f64| {
+            let p = base.map(|c| (c as f64 * light).round() as u8);
+            ascii_cell([p[0], p[1], p[2], 255], [p[0], p[1], p[2], 255], false)
+                .unwrap()
+                .0
+        };
+        for light in [1.0, 0.8, 0.6, 0.45] {
+            let chars: Vec<char> = render3d::STICKER_RGB
+                .iter()
+                .map(|&c| lit(c, light))
+                .collect();
+            assert!(
+                chars.windows(2).all(|w| w[0] == w[1]),
+                "light {light}: {chars:?}"
+            );
+        }
+        // and brighter light gives a denser character
+        let rank = |c: char| RAMP.iter().position(|&b| b as char == c).unwrap();
+        let ranks: Vec<usize> = [0.45, 0.6, 0.8, 1.0]
+            .iter()
+            .map(|&l| rank(lit([214, 40, 40], l)))
+            .collect();
+        assert!(ranks.windows(2).all(|w| w[0] < w[1]), "{ranks:?}");
+    }
+
+    #[test]
+    fn the_three_visible_faces_use_different_characters() {
+        let mut v = ascii_view(Look::Mono, "");
+        v.camera = Camera::default();
+        let (text, _) = render(&v, 120, 50);
+        // a solved cube: each face is one color, so a face is one density; the
+        // top (lit most), front and side must all differ
+        let used: Vec<char> = RAMP
+            .iter()
+            .map(|&b| b as char)
+            .filter(|c| text.contains(*c))
+            .collect();
+        assert!(used.len() >= 3, "{used:?}");
+    }
+
+    #[test]
+    fn the_zoomed_text_cube_fits_at_the_default_view_for_every_size() {
+        let opts = render3d::Options {
+            ss: 1,
+            sticker_fill: TEXT_FILL,
+            zoom: TEXT_ZOOM,
+            shade_range: TEXT_SHADE_RANGE,
+        };
+        for size in 2..=7 {
+            let img =
+                render3d::render_opts(&Nxn::solved(size), Camera::default(), None, 200, 200, opts);
+            for i in 0..200 {
+                for (x, y) in [(i, 0), (i, 199), (0, i), (199, i)] {
+                    assert_eq!(
+                        img.pixel(x, y)[3],
+                        0,
+                        "{size}x{size} touches the edge at {x},{y}"
+                    );
+                }
+            }
+        }
     }
 }

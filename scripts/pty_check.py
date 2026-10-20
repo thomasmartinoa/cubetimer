@@ -14,6 +14,7 @@ Exits non-zero if any check fails. Uses a throwaway data directory.
 """
 
 import fcntl
+import json
 import os
 import pty
 import re
@@ -149,6 +150,29 @@ for term in ("xterm-256color", "foot"):
     os.write(fd5, b"q")
     code5 = wait_exit(pid5)
     check(f"q still quits afterwards ({term})", code5 == 0, f"exit {code5}")
+
+# The cube look (m): with no image support the view starts as half blocks
+# and every press must change what is drawn (ascii, mono, blocks, ascii...).
+# The terminal only gets the cells that changed, so check that each press
+# redraws most of the cube, then that the final choice was saved.
+pid7, fd7 = spawn("xterm-256color")
+pump(fd7, 2.5)
+os.write(fd7, b"v")
+opened = text(pump(fd7, 1.0))
+check("the cube view starts as half blocks without image support", "[m: half blocks]" in opened)
+for look in ("ascii", "mono", "blocks", "ascii"):
+    os.write(fd7, b"m")
+    redraw = pump(fd7, 0.6)
+    check(f"m redraws the cube as {look}", len(redraw) > 1500, f"{len(redraw)} bytes")
+os.write(fd7, b"\x1b")
+pump(fd7, 0.3)
+os.write(fd7, b"q")
+check("q quits after cycling the look", wait_exit(pid7) == 0)
+try:
+    saved = json.load(open(os.path.join(DATA, "cubetimer", "sessions.json")))["settings"]["look"]
+except Exception as e:
+    saved = f"unreadable: {e}"
+check("the chosen look is saved", saved == "ascii", saved)
 
 # Mouse: reporting is on only while the cube view is open, and a drag turns
 # the cube (SGR mouse sequences, as kitty, foot, Ghostty and WezTerm send).

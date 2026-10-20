@@ -19,7 +19,7 @@ use crate::stats::{self, Penalty, Summary, TimeResult};
 use crate::statsview::StatsView;
 use crate::store::{self, Data, Loaded, Session, Settings, Solve};
 use crate::ui;
-use crate::view3d::{CubeView, Gfx};
+use crate::view3d::{CubeView, Gfx, Look};
 
 /// How long space must be held before the timer is ready.
 pub const HOLD_READY: Duration = Duration::from_millis(300);
@@ -88,6 +88,11 @@ fn typed(key: KeyEvent) -> KeyCode {
     }
 }
 
+/// Whether `code` is the key that cycles the cube look.
+fn key_code_is_look(code: KeyCode) -> bool {
+    code == KeyCode::Char('m')
+}
+
 pub struct App {
     pub state: State,
     pub data: Data,
@@ -111,6 +116,8 @@ pub struct App {
     pub cube_view: Option<CubeView>,
     /// How the terminal shows images, for the cube view.
     pub gfx: Gfx,
+    /// How the cube view draws the cube (`m` cycles it).
+    pub look: Look,
     /// The key last pressed and not yet released (with release events only),
     /// to tell auto-repeat from a new press.
     down: Option<KeyCode>,
@@ -147,6 +154,7 @@ impl App {
             stats: None,
             cube_view: None,
             gfx: Gfx::default(),
+            look: Look::default(),
             down: None,
             pb_flash: None,
             inspection_on: true,
@@ -175,6 +183,7 @@ impl App {
         self.font = font::index_of(&settings.font);
         self.inspection_on = settings.inspection;
         self.bell = settings.bell;
+        self.look = Look::from_name(&settings.look);
         self.reset_scrambler();
         self
     }
@@ -200,6 +209,7 @@ impl App {
             font: font::name_at(self.font).into(),
             inspection: self.inspection_on,
             bell: self.bell,
+            look: self.look.name().into(),
         };
         if let Some(path) = &self.path
             && let Err(e) = store::save(path, &self.data)
@@ -342,8 +352,13 @@ impl App {
             return;
         }
         if let Some(view) = self.cube_view.as_mut() {
+            view.has_images = self.gfx.has_images();
             if !view.key(code, now) {
                 self.cube_view = None;
+            } else if view.look != self.look && key_code_is_look(code) {
+                // `m` changed the look: remember it for the next view and run
+                self.look = view.look;
+                self.persist();
             }
             return;
         }
@@ -516,7 +531,19 @@ impl App {
             ),
             None => (format!("{name} scramble"), self.scramble.clone()),
         };
-        self.cube_view = CubeView::new(title, size, &scramble);
+        // find out what the terminal can show before choosing how to start
+        self.gfx.ensure_picker();
+        let has_images = self.gfx.has_images();
+        self.cube_view = CubeView::new(title, size, &scramble).map(|mut v| {
+            v.has_images = has_images;
+            // "image" on a terminal without images is half blocks; start there
+            // so the first `m` changes what is drawn
+            v.look = match self.look {
+                Look::Image if !has_images => Look::Blocks,
+                look => look,
+            };
+            v
+        });
     }
 
     /// Keys while the history browser is open. The list runs newest first, so
@@ -1997,6 +2024,50 @@ mod tests {
         key(&mut app, KeyCode::Char('s'));
         let view = app.stats.as_ref().unwrap();
         assert_eq!(view.report.count, 0);
+    }
+
+    #[test]
+    fn the_cube_look_is_remembered_across_views_and_restarts() {
+        let dir = std::env::temp_dir().join(format!("cubetimer-look-test-{}", std::process::id()));
+        let path = dir.join("sessions.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new(true).with_storage(path.clone(), store::load(&path));
+        settle(&mut app);
+        assert_eq!(app.look, Look::Image);
+        key(&mut app, KeyCode::Char('v'));
+        // no images in a test, so the view starts as half blocks and the
+        // first press already changes what is drawn
+        assert_eq!(app.cube_view.as_ref().unwrap().look, Look::Blocks);
+        key(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.look, Look::Ascii);
+        key(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.look, Look::Mono);
+        key(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.look, Look::Blocks);
+        key(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.look, Look::Ascii);
+        key(&mut app, KeyCode::Esc);
+        // the next view starts in the same look
+        key(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.cube_view.as_ref().unwrap().look, Look::Ascii);
+        key(&mut app, KeyCode::Esc);
+        // and so does the next run
+        let mut again = App::new(true).with_storage(path.clone(), store::load(&path));
+        assert_eq!(again.look, Look::Ascii);
+        settle(&mut again);
+        key(&mut again, KeyCode::Char('v'));
+        assert_eq!(again.cube_view.as_ref().unwrap().look, Look::Ascii);
+    }
+
+    #[test]
+    fn an_unknown_saved_look_falls_back_to_the_default() {
+        let mut loaded = store::Loaded {
+            data: Data::default(),
+            warning: None,
+        };
+        loaded.data.settings.look = "from-a-newer-version".into();
+        let app = App::new(true).with_storage(PathBuf::from("/nonexistent/sessions.json"), loaded);
+        assert_eq!(app.look, Look::default());
     }
 }
 
