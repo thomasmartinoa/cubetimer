@@ -192,6 +192,59 @@ pub fn render_with(
     height: usize,
     ss: usize,
 ) -> Image {
+    render_opts(
+        cube,
+        camera,
+        turning,
+        width,
+        height,
+        Options {
+            ss,
+            ..Options::default()
+        },
+    )
+}
+
+/// How the cube is drawn, apart from where it is looking.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Options {
+    /// Samples per pixel along each axis, 1 to 4.
+    pub ss: usize,
+    /// How much of its square a sticker fills; the rest is black plastic. A
+    /// smaller fill leaves wider gaps, which text views need because one
+    /// character is a coarse pixel.
+    pub sticker_fill: f64,
+    /// 1.0 leaves room for the cube to turn to any angle without leaving the
+    /// image; more fills the image and may clip a corner while it turns.
+    pub zoom: f64,
+    /// How strongly the light changes a face's brightness: a face lit
+    /// straight on is full brightness, one turned away is `1 - shade_range`.
+    /// 0.28 reads as a solid in a picture; text wants more contrast.
+    pub shade_range: f64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            ss: 3,
+            sticker_fill: 0.86,
+            zoom: 1.0,
+            shade_range: 0.28,
+        }
+    }
+}
+
+/// `render_with` with every option.
+pub fn render_opts(
+    cube: &Nxn,
+    camera: Camera,
+    turning: Option<Turning>,
+    width: usize,
+    height: usize,
+    opts: Options,
+) -> Image {
+    let (ss, sticker_fill, shade_range) =
+        (opts.ss, opts.sticker_fill, opts.shade_range.clamp(0.0, 0.9));
     let ss = ss.clamp(1, 4);
     let (w, h) = (width * ss, height * ss);
     let mut buf = vec![[0u8; 4]; w * h];
@@ -205,7 +258,7 @@ pub fn render_with(
 
     let n = cube.size() as f64;
     let cell = 2.0 / n;
-    let half_sticker = cell / 2.0 * 0.86;
+    let half_sticker = cell / 2.0 * sticker_fill.clamp(0.3, 0.98);
     let half_plate = cell / 2.0;
     let light = {
         let l: V3 = [-0.35, 0.8, 0.5];
@@ -244,7 +297,7 @@ pub fn render_with(
         if dot(n_view, to_eye) <= 0.0 {
             continue;
         }
-        let shade = 0.72 + 0.28 * dot(nrm, light).max(0.0);
+        let shade = (1.0 - shade_range) + shade_range * dot(nrm, light).max(0.0);
         let rgb = STICKER_RGB[color as usize].map(|x| (x as f64 * shade).round().min(255.0) as u8);
         let plate: Vec<V3> = square(center, normal_f, half_plate)
             .iter()
@@ -294,7 +347,7 @@ pub fn render_with(
     // perspective, sized so the whole cube fits whatever way it is turned
     let radius = 3f64.sqrt();
     let fit = radius * EYE / (EYE - radius);
-    let pixels_per_unit = 0.94 * (w.min(h) as f64) / 2.0 / fit;
+    let pixels_per_unit = opts.zoom.clamp(0.5, 3.0) * 0.94 * (w.min(h) as f64) / 2.0 / fit;
     let project = |p: V3| -> (f64, f64) {
         let k = EYE / (EYE - p[2]);
         (

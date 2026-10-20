@@ -30,8 +30,8 @@ already run.
   you scrambled it right.
 - **3D cube.** `v` shows the scrambled cube in 3D: drag it with the mouse or the arrow keys
   to look at every side, and press space to watch the scramble being done move by move.
-  A real image in kitty, Ghostty, foot and WezTerm, half blocks elsewhere. See
-  [The 3D view](#the-3d-view).
+  A real image in kitty, Ghostty, foot and WezTerm, half blocks elsewhere, or ASCII art in
+  any terminal (`m` switches). See [The 3D view](#the-3d-view).
 - **Live stats.** Best, mean, mo3, ao5, ao12, ao100, best ao5 and best ao12. The average
   drops the best and worst 5% (at least one each) and a DNF counts as the worst result.
 - **Statistics.** Press `s` for a full-screen view: a time chart with rolling ao5 and ao12,
@@ -210,6 +210,7 @@ scramble.
 | `,` / `.` | One move back / forward |
 | `Home` / `End` | Solved / fully scrambled |
 | `+` / `-` | Faster / slower |
+| `m` | Change how the cube is drawn: image, half blocks, ASCII or mono ASCII (saved) |
 | `Tab` | Switch between 3D and the flat net |
 | `Esc` / `v` / `q` | Close |
 
@@ -221,6 +222,16 @@ How the cube is drawn depends on the terminal:
 | WezTerm | iTerm2 image protocol |
 | foot | sixel |
 | Alacritty and anything else | half-block characters (lower resolution, works everywhere) |
+
+Press `m` to change the look, in this order: the image (only where the terminal can show
+one), half blocks, ASCII and mono ASCII. Your choice is saved.
+
+![the 3D view drawn as colored ASCII art: each face has its own density, and the stickers' colors are kept](docs/screenshots/cube3d-ascii.png)
+
+In ASCII the character comes from how brightly a face is lit, so the three visible faces
+look different (`%` on top, `+` and `:` on the sides), and the stickers keep their colors;
+mono ASCII drops the color. A character is a coarse pixel, so it is rougher than the
+image, but it works in every terminal and over ssh.
 
 The terminal is recognized from `TERM` and `TERM_PROGRAM`, without sending it queries.
 Set `CUBETIMER_GRAPHICS` to `kitty`, `sixel`, `iterm2` or `halfblocks` to choose yourself,
