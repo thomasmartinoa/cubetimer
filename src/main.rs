@@ -1,3 +1,4 @@
+mod anim;
 mod app;
 mod chart;
 mod cube;
@@ -5,6 +6,7 @@ mod fmt;
 mod font;
 mod nxn;
 mod puzzle;
+mod render3d;
 mod scramble;
 mod stats;
 mod statsview;
@@ -13,6 +15,7 @@ mod term;
 mod twobytwo;
 mod twophase;
 mod ui;
+mod view3d;
 
 use std::io;
 use std::path::PathBuf;

@@ -27,7 +27,11 @@ already run.
   and its own kind of scramble, made the way the WCA's official scrambler (TNoodle) makes
   it. See [Scrambles](#scrambles).
 - **Scramble preview.** A colored net of the scrambled cube at every size, so you can check
-  you scrambled it right; `v` shows it full screen.
+  you scrambled it right.
+- **3D cube.** `v` shows the scrambled cube in 3D: drag it with the mouse or the arrow keys
+  to look at every side, and press space to watch the scramble being done move by move.
+  A real image in kitty, Ghostty, foot and WezTerm, half blocks elsewhere. See
+  [The 3D view](#the-3d-view).
 - **Live stats.** Best, mean, mo3, ao5, ao12, ao100, best ao5 and best ao12. The average
   drops the best and worst 5% (at least one each) and a DNF counts as the worst result.
 - **Statistics.** Press `s` for a full-screen view: a time chart with rolling ao5 and ao12,
@@ -71,7 +75,7 @@ yay -S cubetimer        # or paru -S cubetimer
 
 ### From source
 
-You need Rust 1.89 or newer.
+You need Rust 1.90 or newer.
 
 ```sh
 git clone https://github.com/thomasmartinoa/cubetimer
@@ -99,7 +103,7 @@ kitty --start-as=fullscreen cubetimer
 | `h` | History: browse, mark and delete any solve |
 | `s` | Statistics: chart, distribution and summary (`r` or `1`-`4` change the range, `Esc` closes) |
 | `e` | Choose the puzzle: 2x2, 3x3, 4x4, 5x5, 6x6 or 7x7 (`2`-`7` jump straight to one) |
-| `v` | Full-screen scramble preview (any key closes) |
+| `v` | The scrambled cube in 3D (also from the history, for that solve) |
 | `n` | New session of the current puzzle (not while the current one is empty) |
 | `[` / `]` | Previous / next session of the current puzzle |
 | `X` | Delete the current session and its solves (asks `y` / `n`) |
@@ -191,6 +195,40 @@ plain (1 row)
 Run `cargo run --example fonts` to print them, or `cargo run --example fonts -- 1:02.34+`
 to try other text.
 
+## The 3D view
+
+![the 3D view: a scrambled cube with rounded stickers, the scramble below with the current move highlighted](docs/screenshots/cube3d.png)
+
+Press `v` on the timer screen for the current scramble, or in the history for that solve's
+scramble.
+
+| Key | Action |
+|---|---|
+| drag, arrows or `h` `j` `k` `l` | Turn the cube to look at it (hold an arrow to keep turning) |
+| `r` | Back to the usual view: white on top, green in front |
+| `space` | Play the scramble from a solved cube, move by move; again to pause |
+| `,` / `.` | One move back / forward |
+| `Home` / `End` | Solved / fully scrambled |
+| `+` / `-` | Faster / slower |
+| `Tab` | Switch between 3D and the flat net |
+| `Esc` / `v` / `q` | Close |
+
+How the cube is drawn depends on the terminal:
+
+| Terminal | Drawn with |
+|---|---|
+| kitty, Ghostty | kitty graphics protocol |
+| WezTerm | iTerm2 image protocol |
+| foot | sixel |
+| Alacritty and anything else | half-block characters (lower resolution, works everywhere) |
+
+The terminal is recognized from `TERM` and `TERM_PROGRAM`, without sending it queries.
+Set `CUBETIMER_GRAPHICS` to `kitty`, `sixel`, `iterm2` or `halfblocks` to choose yourself,
+for example for another terminal that supports one of those. tmux is untested.
+
+The mouse is only captured while the 3D view is open; on every other screen the terminal
+keeps it for selecting text.
+
 ## Scrambles
 
 Each puzzle is scrambled the way TNoodle, the WCA's official scramble program, does it.
@@ -266,8 +304,9 @@ The first line should say `keyboard enhancement: ON`.
 - No import from csTimer or other timers (export to CSV is supported), no session names,
   and no Bluetooth smart cubes.
 - The hold time before the timer is ready is fixed at 0.3 s.
-- The scramble preview uses true color (24-bit), which every terminal listed above
-  supports.
+- The scramble preview and the 3D view use true color (24-bit), which every terminal
+  listed above supports.
+- The 3D view hasn't been tried inside tmux.
 
 ## Development
 
@@ -282,7 +321,8 @@ The code is split by job: `cube.rs` (the 3x3 at the piece level), `twophase.rs` 
 solver), `nxn.rs` (cubes of any size as stickers in space), `twobytwo.rs` (the 2x2 state
 table), `puzzle.rs`, `scramble.rs`, `fmt.rs` (time formatting), `stats.rs` (averages), `font.rs`
 (digit fonts), `store.rs` (sessions on disk), `app.rs` (state machine), `ui.rs`
-(drawing), `chart.rs` (axis ticks, outliers, histograms) and `statsview.rs` (the statistics
+(drawing), `render3d.rs` (the 3D renderer), `anim.rs` (playing moves), `view3d.rs` (the 3D
+view), `chart.rs` (axis ticks, outliers, histograms) and `statsview.rs` (the statistics
 screen and the chart). `term.rs` owns raw mode and the keyboard protocol, and restores the terminal on
 exit, on panic and on signals.
 

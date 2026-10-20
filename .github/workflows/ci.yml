@@ -22,10 +22,10 @@ jobs:
       - name: End-to-end checks on a pseudo-terminal
         run: python3 scripts/pty_check.py target/release/cubetimer
 
-  # Cargo.toml promises rust-version = "1.89"; keep that honest.
+  # Cargo.toml promises rust-version = "1.90"; keep that honest.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89
+      - uses: dtolnay/rust-toolchain@1.90
       - run: cargo build --locked

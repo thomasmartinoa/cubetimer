@@ -129,7 +129,7 @@ DNFs, one solve, identical times.
 **Done when:** a 500-solve session with outliers reads clearly at 80x24 and fullscreen.
 Suggested model: Sonnet.
 
-## Phase 3: 3D cube view — `feat/3d`
+## Phase 3: 3D cube view — `feat/3d` — done (merged into dev)
 
 **Is it practical?** Yes. Terminals can show real images: kitty, Ghostty and WezTerm
 through the kitty graphics protocol, foot through sixel. The

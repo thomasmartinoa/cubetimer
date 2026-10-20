@@ -14,6 +14,7 @@ use crate::font;
 use crate::nxn;
 use crate::stats::{Penalty, TimeResult};
 use crate::statsview;
+use crate::view3d;
 
 fn tone_color(tone: Tone) -> Color {
     match tone {
@@ -35,6 +36,10 @@ const COMPACT_MIN_HEIGHT: u16 = 8;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    if let Some(view) = &app.cube_view {
+        view3d::draw(frame, area, view, &app.gfx);
+        return;
+    }
     if let Some(view) = &app.stats {
         statsview::draw(frame, area, app, view);
         return;
@@ -76,9 +81,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if app.show_help {
         draw_help(frame, area);
-    }
-    if app.show_preview {
-        draw_big_preview(frame, area, app);
     }
     if let Some(selected) = app.picker {
         draw_picker(frame, area, app, selected);
@@ -314,9 +316,15 @@ fn net_grid(scramble: &str, size: usize) -> Option<Vec<Vec<Option<Color>>>> {
     let moves = nxn::parse(scramble)?;
     let mut cube = nxn::Nxn::solved(size);
     cube.apply_all(&moves);
+    Some(net_grid_of(&cube))
+}
+
+/// The net of `cube` (see `net_grid`).
+pub fn net_grid_of(cube: &nxn::Nxn) -> Vec<Vec<Option<Color>>> {
+    let size = cube.size();
     let stickers = cube.facelets();
     let pitch = size + 1;
-    let grid = (0..3 * pitch - 1)
+    (0..3 * pitch - 1)
         .map(|row| {
             (0..4 * pitch - 1)
                 .map(|col| {
@@ -338,21 +346,22 @@ fn net_grid(scramble: &str, size: usize) -> Option<Vec<Vec<Option<Color>>>> {
                 })
                 .collect()
         })
-        .collect();
-    Some(grid)
+        .collect()
 }
 
 /// Text rows the net takes (two half-rows each).
-fn net_rows(grid: &[Vec<Option<Color>>]) -> usize {
+pub fn net_rows(grid: &[Vec<Option<Color>>]) -> usize {
     grid.len().div_ceil(2)
 }
 
 /// The net as lines of half blocks, every sticker `scale` columns wide and
-/// `scale` half-rows tall.
-fn net_lines(grid: &[Vec<Option<Color>>], scale: usize) -> Vec<Line<'static>> {
+/// `scale` half-rows tall. From scale 3 up, each sticker leaves its last
+/// column and half-row empty, so neighbours of the same color stay apart.
+pub fn net_lines(grid: &[Vec<Option<Color>>], scale: usize) -> Vec<Line<'static>> {
     let (rows, cols) = (grid.len() * scale, grid[0].len() * scale);
+    let gap = scale >= 3;
     let cell = |row: usize, col: usize| -> Option<Color> {
-        if row >= rows {
+        if row >= rows || (gap && (row % scale == scale - 1 || col % scale == scale - 1)) {
             return None;
         }
         grid[row / scale][col / scale]
@@ -372,45 +381,6 @@ fn net_lines(grid: &[Vec<Option<Color>>], scale: usize) -> Vec<Line<'static>> {
             Line::from(spans)
         })
         .collect()
-}
-
-/// The full-screen scramble preview (`v`): the net as large as fits.
-fn draw_big_preview(frame: &mut Frame, area: Rect, app: &App) {
-    let size = app.puzzle().size();
-    let Some(grid) = net_grid(&app.scramble, size) else {
-        return;
-    };
-    let (rows, cols) = (grid.len(), grid[0].len());
-    // each sticker at least one column and half-row, up to 4 when there is room
-    let scale = (1..=4usize)
-        .rev()
-        .find(|&k| {
-            cols * k + 4 <= area.width as usize
-                && (rows * k).div_ceil(2) + 4 <= area.height as usize
-        })
-        .unwrap_or(1);
-    let width = (cols * scale + 4).min(area.width as usize) as u16;
-    let height = ((rows * scale).div_ceil(2) + 4).min(area.height as usize) as u16;
-    let [popup] = Layout::horizontal([Constraint::Length(width)])
-        .flex(Flex::Center)
-        .areas(area);
-    let [popup] = Layout::vertical([Constraint::Length(height)])
-        .flex(Flex::Center)
-        .areas(popup);
-    frame.render_widget(Clear, popup);
-    let block = Block::bordered()
-        .title(format!(" {} scramble preview ", app.puzzle().name()))
-        .title_bottom(Line::from(" any key closes ").right_aligned());
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    frame.render_widget(
-        Paragraph::new(net_lines(&grid, scale)).alignment(Alignment::Center),
-        Rect {
-            y: inner.y + 1,
-            height: inner.height.saturating_sub(1),
-            ..inner
-        },
-    );
 }
 
 /// The puzzle picker (`e`).
@@ -589,7 +559,7 @@ const HELP: [(&str, &str); 22] = [
     ("h", "history: browse, mark and delete any solve"),
     ("s", "statistics: chart, distribution, summary"),
     ("e", "choose the puzzle: 2x2 to 7x7"),
-    ("v", "full-screen scramble preview"),
+    ("v", "the scrambled cube in 3D: turn it, watch the scramble"),
     ("n", "new session"),
     ("[ / ]", "previous / next session"),
     ("X", "delete the whole session (asks y / n)"),
@@ -1328,27 +1298,22 @@ mod tests {
     }
 
     #[test]
-    fn the_full_preview_shows_every_size_big() {
+    fn the_cube_view_replaces_the_screen_for_every_size() {
         for digit in ['2', '4', '7'] {
             let mut app = app();
             crate::app::tests_support::set_puzzle(&mut app, digit);
-            app.scramble = "R U".into(); // switching clears it, so set it after
-            app.show_preview = true;
+            app.scramble = "R U".into();
+            app.cube_view =
+                crate::view3d::CubeView::new("x scramble", app.puzzle().size(), &app.scramble);
             let out = render(&app, 120, 40);
-            assert!(out.contains("scramble preview"), "{digit}");
-            assert!(out.contains("any key closes"));
+            assert!(out.contains("x scramble"), "{digit}");
+            assert!(out.contains("esc close"));
+            assert!(!out.contains("recent times"), "full screen");
             let blocks = out
                 .chars()
                 .filter(|&c| c == '\u{2580}' || c == '\u{2584}')
                 .count();
-            assert!(blocks > 40, "{digit}: {blocks}");
-        }
-        // and never panics when there is no room
-        let mut app = app();
-        app.scramble = "R U".into();
-        app.show_preview = true;
-        for (w, h) in [(10, 5), (30, 10), (60, 12)] {
-            render(&app, w, h);
+            assert!(blocks > 100, "{digit}: {blocks}");
         }
     }
 
@@ -1594,5 +1559,27 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 1, "no interior labels found");
+    }
+
+    #[test]
+    fn big_nets_keep_same_colored_stickers_apart() {
+        let grid = net_grid("U U'", 3).unwrap(); // solved: whole faces one color
+        let lines = net_lines(&grid, 4);
+        // the U face spans columns 16..28 at scale 4; a gap column after each sticker
+        let row: Vec<String> = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(row[19], " ", "gap after the first U sticker");
+        assert_ne!(row[18], " ");
+        // small scales stay solid
+        let small = net_lines(&grid, 2);
+        let row: Vec<String> = small[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_ne!(row[9], " ");
     }
 }
