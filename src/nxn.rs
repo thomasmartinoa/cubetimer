@@ -59,9 +59,14 @@ impl Move {
     }
 
     /// The axis the move turns about: 0 is x (R, L), 1 is y (U, D), 2 is z.
-    #[cfg(test)]
     pub fn axis(self) -> usize {
         NORMALS[self.face as usize].0
+    }
+
+    /// +1 if the move's face is on the positive side of its axis (U R F),
+    /// -1 otherwise.
+    pub fn sign(self) -> i8 {
+        NORMALS[self.face as usize].1
     }
 }
 
@@ -145,7 +150,6 @@ impl Nxn {
         Nxn { size, stickers }
     }
 
-    #[allow(dead_code)]
     pub fn size(&self) -> usize {
         self.size
     }
@@ -172,6 +176,28 @@ impl Nxn {
         for &m in moves {
             self.apply(m);
         }
+    }
+
+    /// Every sticker as (center, outward normal, color) in cube coordinates:
+    /// the cube spans -1..1 on each axis, so a sticker is `2 / size` wide.
+    /// What the 3D view draws.
+    pub fn stickers(&self) -> impl Iterator<Item = ([f64; 3], [i8; 3], u8)> + '_ {
+        let n = self.size as f64;
+        self.stickers.iter().map(move |s| {
+            let pos = s.pos.map(|c| c as f64 / n);
+            (pos, s.normal, s.color)
+        })
+    }
+
+    /// Whether a sticker at `center` (as from `stickers`) is in the layers that
+    /// `m` turns.
+    pub fn in_layers(&self, m: Move, center: [f64; 3]) -> bool {
+        let (axis, sign) = NORMALS[m.face as usize];
+        let n = self.size as f64;
+        // back in doubled coordinates: layer k from the face is at n-1-2k
+        let c = sign as f64 * center[axis] * n;
+        let lowest = (n - 1.0) - 2.0 * (m.layers as f64 - 1.0);
+        c >= lowest - 0.5
     }
 
     /// The colors (0..6, U R F D L B) of all 6 N² stickers, face by face; each

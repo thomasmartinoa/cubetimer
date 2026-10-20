@@ -8,6 +8,8 @@ Runs the timer as a terminal would, without a desktop, and checks:
   - a terminal that never answers queries still starts (after a timeout)
   - a second copy refuses to start while one is running
   - SIGTERM and SIGHUP restore the terminal and exit with 128 + signal
+  - the cube view (v) opens quickly and keys keep working afterwards, even in
+    a terminal that never answers queries
 Exits non-zero if any check fails. Uses a throwaway data directory.
 """
 
@@ -35,10 +37,11 @@ def check(name, ok, detail=""):
         failures.append(name)
 
 
-def spawn():
+def spawn(term=None):
     pid, fd = pty.fork()
     if pid == 0:
-        os.execve(BINARY, [BINARY], ENV)
+        env = dict(ENV, TERM=term) if term else ENV
+        os.execve(BINARY, [BINARY], env)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
     return pid, fd
 
@@ -123,6 +126,50 @@ check("starts even if the terminal never answers", b"scramble" in screen)
 os.write(fd4, b"q")
 code4 = wait_exit(pid4)
 check("q quits with exit code 0", code4 == 0, f"exit {code4}")
+
+# The cube view in terminals that never answer: as plain xterm (no query is
+# made) and as foot (which needs one cell-size query, given up after 300 ms).
+# Keys typed afterwards must still reach the app.
+for term in ("xterm-256color", "foot"):
+    pid5, fd5 = spawn(term)
+    pump(fd5, 2.5)
+    os.write(fd5, b"v")
+    t0 = time.time()
+    shown = False
+    while time.time() - t0 < 3:
+        if "blocks]" in text(pump(fd5, 0.1)):  # "[half blocks]" in the footer
+            shown = True
+            break
+    took = time.time() - t0
+    check(f"cube view opens within 1 s ({term}, terminal never answers)", shown and took < 1.0, f"{took:.2f} s")
+    os.write(fd5, b" ")  # play the scramble
+    check(f"keys still reach the app after opening it ({term})", "pause" in text(pump(fd5, 0.6)))
+    os.write(fd5, b"\x1b")
+    pump(fd5, 0.3)
+    os.write(fd5, b"q")
+    code5 = wait_exit(pid5)
+    check(f"q still quits afterwards ({term})", code5 == 0, f"exit {code5}")
+
+# Mouse: reporting is on only while the cube view is open, and a drag turns
+# the cube (SGR mouse sequences, as kitty, foot, Ghostty and WezTerm send).
+pid6, fd6 = spawn()
+before_view = pump(fd6, 2.5, answer_da1=True)
+check("mouse reporting is off on the timer screen", b"\x1b[?1000h" not in before_view)
+os.write(fd6, b"v")
+opened = pump(fd6, 0.8)
+check("mouse reporting turns on with the cube view", b"\x1b[?1000h" in opened and b"\x1b[?1006h" in opened)
+os.write(fd6, b"\x1b[<0;40;15M")            # left button down
+pump(fd6, 0.1)
+os.write(fd6, b"\x1b[<32;52;15M")           # drag 12 columns right
+dragged = pump(fd6, 0.6)
+os.write(fd6, b"\x1b[<0;52;15m")            # release
+pump(fd6, 0.1)
+check("a mouse drag redraws the cube", len(dragged) > 1000, f"{len(dragged)} bytes")
+os.write(fd6, b"\x1b")
+closed = pump(fd6, 0.6)
+check("mouse reporting turns off when the view closes", b"\x1b[?1000l" in closed)
+os.write(fd6, b"q")
+check("q quits after using the mouse", wait_exit(pid6) == 0)
 
 print(f"\n{len(failures)} failed" if failures else "\nall passed")
 sys.exit(1 if failures else 0)

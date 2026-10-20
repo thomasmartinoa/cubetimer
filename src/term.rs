@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use ratatui::crossterm::{
     cursor::Show,
     event::{
-        DisableFocusChange, EnableFocusChange, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -60,11 +60,27 @@ pub fn restore() {
         let _ = execute!(out, PopKeyboardEnhancementFlags);
     }
     if ACTIVE.swap(false, Ordering::SeqCst) {
-        let _ = execute!(out, DisableFocusChange, LeaveAlternateScreen);
+        let _ = execute!(
+            out,
+            DisableMouseCapture,
+            DisableFocusChange,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
     let _ = execute!(out, Show);
     let _ = out.flush();
+}
+
+/// Turn mouse reporting on or off. It is only on while the cube view is open:
+/// with it on, the terminal can't select text with the mouse.
+pub fn set_mouse(on: bool) -> io::Result<()> {
+    let mut out = io::stdout();
+    if on {
+        execute!(out, EnableMouseCapture)
+    } else {
+        execute!(out, DisableMouseCapture)
+    }
 }
 
 /// Restore the terminal and exit on SIGTERM, SIGHUP, SIGQUIT or SIGINT. These

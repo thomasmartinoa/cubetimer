@@ -19,6 +19,7 @@ use crate::stats::{self, Penalty, Summary, TimeResult};
 use crate::statsview::StatsView;
 use crate::store::{self, Data, Loaded, Session, Settings, Solve};
 use crate::ui;
+use crate::view3d::{CubeView, Gfx};
 
 /// How long space must be held before the timer is ready.
 pub const HOLD_READY: Duration = Duration::from_millis(300);
@@ -106,8 +107,10 @@ pub struct App {
     pub stats: Option<StatsView>,
     /// The puzzle picker is open with this puzzle highlighted.
     pub picker: Option<usize>,
-    /// The full-screen scramble preview is open.
-    pub show_preview: bool,
+    /// The cube view (`v`), when open.
+    pub cube_view: Option<CubeView>,
+    /// How the terminal shows images, for the cube view.
+    pub gfx: Gfx,
     /// The key last pressed and not yet released (with release events only),
     /// to tell auto-repeat from a new press.
     down: Option<KeyCode>,
@@ -142,7 +145,8 @@ impl App {
             show_help: false,
             picker: None,
             stats: None,
-            show_preview: false,
+            cube_view: None,
+            gfx: Gfx::default(),
             down: None,
             pb_flash: None,
             inspection_on: true,
@@ -205,7 +209,17 @@ impl App {
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        let mut mouse = false;
         while !self.quit {
+            if self.cube_view.is_some() {
+                // ask the terminal about images once, before drawing the first image
+                self.gfx.ensure_picker();
+            }
+            // the mouse turns the cube; elsewhere the terminal keeps it for selecting text
+            if self.cube_view.is_some() != mouse {
+                mouse = !mouse;
+                crate::term::set_mouse(mouse)?;
+            }
             terminal.draw(|f| ui::draw(f, self))?;
             if let Some(t) = self.tick_interval()
                 && !event::poll(t)?
@@ -228,6 +242,9 @@ impl App {
 
     /// How long the loop may wait for input; `None` blocks until a key.
     fn tick_interval(&self) -> Option<Duration> {
+        if self.cube_view.as_ref().is_some_and(CubeView::animating) {
+            return Some(Duration::from_millis(30));
+        }
         match self.state {
             State::Idle if self.pb_flash.is_some() || self.scramble.is_empty() => {
                 Some(Duration::from_millis(50))
@@ -243,6 +260,11 @@ impl App {
             Event::Key(key) => self.on_key(key, now),
             // A key let go while another window had focus sends no release.
             Event::FocusLost => self.down = None,
+            Event::Mouse(m) => {
+                if let Some(view) = self.cube_view.as_mut() {
+                    view.mouse(m.kind, m.column, m.row);
+                }
+            }
             _ => {}
         }
     }
@@ -274,7 +296,14 @@ impl App {
             }
         };
         if repeat {
-            // Auto-repeat only scrolls the history list.
+            // Auto-repeat turns the cube in the cube view...
+            if let Some(view) = self.cube_view.as_mut() {
+                if CubeView::repeats(code) {
+                    view.key(code, now);
+                }
+                return;
+            }
+            // ...and otherwise only scrolls the history list.
             let scrolls = matches!(
                 code,
                 KeyCode::Up
@@ -309,7 +338,13 @@ impl App {
             }
             return;
         }
-        if std::mem::take(&mut self.show_help) || std::mem::take(&mut self.show_preview) {
+        if std::mem::take(&mut self.show_help) {
+            return;
+        }
+        if let Some(view) = self.cube_view.as_mut() {
+            if !view.key(code, now) {
+                self.cube_view = None;
+            }
             return;
         }
         if let Some(selected) = self.picker {
@@ -356,7 +391,7 @@ impl App {
                         .unwrap_or(1),
                 );
             }
-            KeyCode::Char('v') if idle => self.show_preview = true,
+            KeyCode::Char('v') if idle => self.open_cube_view(None),
             KeyCode::Char('s') if idle => self.stats = Some(StatsView::new(self)),
             KeyCode::Char('n') if idle => self.new_session(),
             KeyCode::Char('X') if idle => self.confirm_session_delete = true,
@@ -470,6 +505,20 @@ impl App {
         self.history = self.history.filter(|_| len > 0).map(|i| i.min(len - 1));
     }
 
+    /// Open the cube view for the current scramble, or for solve `solve`.
+    fn open_cube_view(&mut self, solve: Option<usize>) {
+        let size = self.puzzle().size();
+        let name = self.puzzle().name();
+        let (title, scramble) = match solve.and_then(|i| self.solves().get(i).map(|s| (i, s))) {
+            Some((i, s)) => (
+                format!("{name} solve {} scramble", i + 1),
+                s.scramble.clone(),
+            ),
+            None => (format!("{name} scramble"), self.scramble.clone()),
+        };
+        self.cube_view = CubeView::new(title, size, &scramble);
+    }
+
     /// Keys while the history browser is open. The list runs newest first, so
     /// "down" moves to older solves (lower indices).
     fn history_key(&mut self, code: KeyCode, selected: usize) {
@@ -486,6 +535,7 @@ impl App {
             KeyCode::Char('d') => self.mark(Some(selected), Penalty::Dnf),
             KeyCode::Char('o') => self.mark(Some(selected), Penalty::Ok),
             KeyCode::Backspace | KeyCode::Delete => self.confirm_delete = Some(selected),
+            KeyCode::Char('v') => self.open_cube_view(Some(selected)),
             KeyCode::Esc | KeyCode::Char('h' | 'q') => self.history = None,
             _ => {}
         }
@@ -577,6 +627,9 @@ impl App {
 
     /// Periodic work: the inspection warning bell.
     pub fn tick(&mut self, now: Instant) {
+        if let Some(view) = self.cube_view.as_mut() {
+            view.tick(now);
+        }
         if self.scramble.is_empty()
             && let Some(s) = self.scrambler.try_next()
         {
@@ -1799,17 +1852,65 @@ mod tests {
     }
 
     #[test]
-    fn full_preview_opens_with_v_and_any_key_closes_it() {
+    fn v_opens_the_cube_view_and_its_keys_stay_inside_it() {
         let mut app = App::new(true);
+        settle(&mut app);
         key(&mut app, KeyCode::Char('v'));
-        assert!(app.show_preview);
+        let view = app.cube_view.as_ref().expect("open");
+        assert_eq!(view.size, 3);
+        assert_eq!(
+            view.player.moves().len(),
+            crate::nxn::parse(&app.scramble).unwrap().len()
+        );
+        // space plays the scramble instead of starting inspection
         key(&mut app, SPACE);
-        assert!(!app.show_preview);
+        assert!(app.cube_view.as_ref().unwrap().player.is_playing());
         assert_eq!(app.state, State::Idle);
+        assert!(app.tick_interval().is_some(), "animates on ticks");
+        key(&mut app, KeyCode::Char('q'));
+        assert!(app.cube_view.is_none());
+        assert!(!app.quit, "q closes the view, not the app");
         // not while inspecting
         key(&mut app, SPACE);
         key(&mut app, KeyCode::Char('v'));
-        assert!(!app.show_preview);
+        assert!(app.cube_view.is_none());
+    }
+
+    #[test]
+    fn holding_an_arrow_keeps_turning_the_cube() {
+        let mut app = App::new(true);
+        settle(&mut app); // a scramble to play
+        key(&mut app, KeyCode::Char('v'));
+        let t = Instant::now();
+        let start = app.cube_view.as_ref().unwrap().camera;
+        app.on_key(press(KeyCode::Left), t);
+        app.on_key(press(KeyCode::Left), t); // Ghostty-style repeat
+        let rep = KeyEvent::new_with_kind(KeyCode::Left, KeyModifiers::NONE, KeyEventKind::Repeat);
+        app.on_key(rep, t); // kitty-style repeat
+        let yaw = app.cube_view.as_ref().unwrap().camera.yaw;
+        assert!(
+            ((start.yaw - yaw).rem_euclid(360.0) - 45.0).abs() < 1e-9,
+            "three turns of 15"
+        );
+        // but a held space doesn't toggle play on every repeat
+        app.on_key(press(SPACE), t);
+        app.on_key(press(SPACE), t);
+        assert!(app.cube_view.as_ref().unwrap().player.is_playing());
+    }
+
+    #[test]
+    fn v_in_history_shows_that_solves_scramble() {
+        let mut app = with_solves(&[1_000, 2_000]);
+        app.data.solves_mut()[0].scramble = "R U R'".into();
+        key(&mut app, KeyCode::Char('h'));
+        key(&mut app, KeyCode::Down); // solve 1
+        key(&mut app, KeyCode::Char('v'));
+        let view = app.cube_view.as_ref().unwrap();
+        assert_eq!(view.title, "3x3 solve 1 scramble");
+        assert_eq!(view.player.moves().len(), 3);
+        key(&mut app, KeyCode::Esc);
+        assert!(app.cube_view.is_none());
+        assert_eq!(app.history, Some(0), "back in the history browser");
     }
 
     #[test]

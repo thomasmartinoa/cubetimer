@@ -6,7 +6,7 @@
   its own sessions, stats and scrambles. Files saved by 0.1.0 open unchanged as 3x3.
 - 2x2 scrambles are random-state (at least 4 moves, as the WCA requires); 4x4 to 7x7 use the
   WCA's random-move lengths and move sets.
-- The scramble preview works at every size, and `v` shows it full screen.
+- The scramble preview works at every size.
 - Long scrambles (up to 100 moves) wrap across as many lines as they need.
 - `--export` has a puzzle column.
 - Statistics screen (`s`): a time chart with rolling ao5 and ao12, personal bests, DNFs and
@@ -14,6 +14,9 @@
   summary with standard deviation and ao50 and ao1000.
 - The chart is drawn so that axis labels and gridlines line up exactly, uses round axis
   values, and a few terrible solves no longer flatten the rest. The history browser uses it.
+- A 3D view of the scrambled cube (`v`, also from the history): drag it or use the arrows
+  to turn it, and play the scramble move by move with animated turns. Drawn as an image in
+  kitty, Ghostty, foot and WezTerm, with half blocks elsewhere.
 
 ## 0.1.0
 

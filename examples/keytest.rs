@@ -3,6 +3,7 @@
 //! Set `KEYTEST_LOG=<file>` to also write the same lines to a file.
 
 #[path = "../src/term.rs"]
+#[allow(dead_code)]
 mod term;
 
 use std::fs::File;
