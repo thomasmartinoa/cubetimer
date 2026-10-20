@@ -75,7 +75,7 @@ yay -S cubetimer        # or paru -S cubetimer
 
 ### From source
 
-You need Rust 1.89 or newer.
+You need Rust 1.90 or newer.
 
 ```sh
 git clone https://github.com/thomasmartinoa/cubetimer

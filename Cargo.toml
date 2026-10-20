@@ -2,7 +2,7 @@
 name = "cubetimer"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.90"
 description = "Full-screen speedcube timer for the terminal: WCA inspection, hold-to-start, random-state scrambles with preview"
 license = "MIT"
 repository = "https://github.com/thomasmartinoa/cubetimer"
