@@ -13,35 +13,78 @@ use crate::render3d::Turning;
 pub const SPEEDS_MS: [u64; 6] = [800, 500, 320, 200, 120, 70];
 const DEFAULT_SPEED: usize = 3;
 
+/// One step of a sequence as a cuber names it: a face turn, a wide turn, a
+/// rotation, or a slice (which is two layer turns that animate as one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub label: String,
+    /// The layer turns the step is made of: one, or two for a slice (the
+    /// wide turn, then the outer layer turned back).
+    pub moves: Vec<Move>,
+}
+
+impl Step {
+    /// One plain layer turn, labelled the way `nxn` writes it.
+    pub fn turn(m: Move) -> Step {
+        Step {
+            label: m.to_string(),
+            moves: vec![m],
+        }
+    }
+
+    /// How the step looks while it turns: the turning layers, and for a
+    /// slice the outer layer that stays still.
+    fn turning(&self, fraction: f64) -> Turning {
+        let except = match self.moves.as_slice() {
+            [wide, outer] if outer.face == wide.face && outer.layers < wide.layers => Some(*outer),
+            _ => None,
+        };
+        Turning {
+            m: self.moves[0],
+            fraction,
+            except,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Player {
-    size: usize,
-    moves: Vec<Move>,
-    /// Moves fully applied so far.
+    /// The cube before the first step.
+    start: Nxn,
+    steps: Vec<Step>,
+    /// Steps fully done so far.
     pos: usize,
-    /// When the turn in progress started, while playing.
+    /// When the step in progress started, while playing.
     turn_started: Option<Instant>,
     speed: usize,
 }
 
 impl Player {
-    /// A player for `moves` on a cube of `size`, showing the end state.
+    /// A player for `moves` on a solved cube of `size`, showing the end
+    /// state (how the timer shows a scramble).
     pub fn new(size: usize, moves: Vec<Move>) -> Player {
-        let pos = moves.len();
+        let steps: Vec<Step> = moves.into_iter().map(Step::turn).collect();
+        Player::from_steps(Nxn::solved(size), steps, true)
+    }
+
+    /// A player for `steps` from `start`, showing the end state if `at_end`,
+    /// otherwise the start (how an algorithm is shown on its case).
+    pub fn from_steps(start: Nxn, steps: Vec<Step>, at_end: bool) -> Player {
+        let pos = if at_end { steps.len() } else { 0 };
         Player {
-            size,
-            moves,
+            start,
+            steps,
             pos,
             turn_started: None,
             speed: DEFAULT_SPEED,
         }
     }
 
-    pub fn moves(&self) -> &[Move] {
-        &self.moves
+    pub fn steps(&self) -> &[Step] {
+        &self.steps
     }
 
-    /// Moves applied so far (the next one to play is `moves()[pos()]`).
+    /// Steps done so far (the next one is `steps()[pos()]`).
     pub fn pos(&self) -> usize {
         self.pos
     }
@@ -54,19 +97,19 @@ impl Player {
         SPEEDS_MS[self.speed]
     }
 
-    fn turn_time(&self, m: Move) -> Duration {
+    fn turn_time(&self, step: &Step) -> Duration {
         // a half turn takes longer than a quarter, but not twice as long
         let base = self.speed_ms() as f64;
-        let k = if m.turns == 2 { 1.5 } else { 1.0 };
+        let k = if step.moves[0].turns == 2 { 1.5 } else { 1.0 };
         Duration::from_millis((base * k) as u64)
     }
 
     /// Play from where it is; from the start if it is at the end.
     pub fn play(&mut self, now: Instant) {
-        if self.moves.is_empty() {
+        if self.steps.is_empty() {
             return;
         }
-        if self.pos == self.moves.len() {
+        if self.pos == self.steps.len() {
             self.pos = 0;
         }
         self.turn_started = Some(now);
@@ -88,7 +131,7 @@ impl Player {
     pub fn step(&mut self, forward: bool) {
         self.pause();
         if forward {
-            self.pos = (self.pos + 1).min(self.moves.len());
+            self.pos = (self.pos + 1).min(self.steps.len());
         } else {
             self.pos = self.pos.saturating_sub(1);
         }
@@ -101,7 +144,7 @@ impl Player {
 
     pub fn fast_forward(&mut self) {
         self.pause();
-        self.pos = self.moves.len();
+        self.pos = self.steps.len();
     }
 
     pub fn faster(&mut self) {
@@ -112,33 +155,35 @@ impl Player {
         self.speed = self.speed.saturating_sub(1);
     }
 
-    /// Advance the clock to `now`: finish every turn whose time is up.
+    /// Advance the clock to `now`: finish every step whose time is up.
     pub fn advance(&mut self, now: Instant) {
         while let Some(started) = self.turn_started {
-            let Some(&m) = self.moves.get(self.pos) else {
+            let Some(step) = self.steps.get(self.pos) else {
                 self.turn_started = None;
                 break;
             };
-            let done = started + self.turn_time(m);
+            let done = started + self.turn_time(step);
             if now < done {
                 break;
             }
             self.pos += 1;
-            self.turn_started = (self.pos < self.moves.len()).then_some(done);
+            self.turn_started = (self.pos < self.steps.len()).then_some(done);
         }
     }
 
-    /// The cube with the first `pos` moves applied, and the turn in progress.
+    /// The cube with the first `pos` steps done, and the step in progress.
     pub fn frame(&self, now: Instant) -> (Nxn, Option<Turning>) {
-        let mut cube = Nxn::solved(self.size);
-        cube.apply_all(&self.moves[..self.pos]);
+        let mut cube = self.start.clone();
+        for step in &self.steps[..self.pos] {
+            cube.apply_all(&step.moves);
+        }
         let turning = self.turn_started.and_then(|started| {
-            let m = *self.moves.get(self.pos)?;
+            let step = self.steps.get(self.pos)?;
             let elapsed = now.saturating_duration_since(started).as_secs_f64();
-            let fraction = (elapsed / self.turn_time(m).as_secs_f64()).clamp(0.0, 1.0);
+            let fraction = (elapsed / self.turn_time(step).as_secs_f64()).clamp(0.0, 1.0);
             // ease in and out, like a hand turning a layer
             let eased = fraction * fraction * (3.0 - 2.0 * fraction);
-            Some(Turning { m, fraction: eased })
+            Some(step.turning(eased))
         });
         (cube, turning)
     }
@@ -298,5 +343,48 @@ mod tests {
         p.advance(ms(t, step + 10));
         let (_, turning) = p.frame(ms(t, step + 10));
         assert_eq!(turning.unwrap().m, nxn::parse("U").unwrap()[0]);
+    }
+
+    #[test]
+    fn a_player_can_start_from_any_cube_at_the_start() {
+        let mut start = Nxn::solved(3);
+        start.apply_all(&nxn::parse("R U").unwrap());
+        let steps = vec![
+            Step::turn(nxn::parse("U'").unwrap()[0]),
+            Step::turn(nxn::parse("R'").unwrap()[0]),
+        ];
+        let mut p = Player::from_steps(start.clone(), steps, false);
+        let t = Instant::now();
+        assert_eq!(p.pos(), 0);
+        assert_eq!(p.frame(t).0, start, "shows the case first");
+        p.fast_forward();
+        assert!(p.frame(t).0.is_solved(), "and the steps solve it");
+    }
+
+    #[test]
+    fn a_slice_step_turns_only_the_middle_layer() {
+        let wide = nxn::Move {
+            face: 4,
+            layers: 2,
+            turns: 1,
+        };
+        let outer = nxn::Move {
+            face: 4,
+            layers: 1,
+            turns: 3,
+        };
+        let step = Step {
+            label: "M".into(),
+            moves: vec![wide, outer],
+        };
+        let t = step.turning(0.5);
+        assert_eq!((t.m, t.except), (wide, Some(outer)));
+        assert_eq!(Step::turn(wide).turning(0.5).except, None);
+        // and doing the step applies both turns
+        let mut p = Player::from_steps(Nxn::solved(3), vec![step], false);
+        p.fast_forward();
+        let mut want = Nxn::solved(3);
+        want.apply_all(&[wide, outer]);
+        assert_eq!(p.frame(Instant::now()).0, want);
     }
 }

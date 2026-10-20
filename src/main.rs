@@ -1,3 +1,6 @@
+mod alg;
+mod algs;
+mod algview;
 mod anim;
 mod app;
 mod chart;
@@ -12,6 +15,7 @@ mod stats;
 mod statsview;
 mod store;
 mod term;
+mod trainer;
 mod twobytwo;
 mod twophase;
 mod ui;

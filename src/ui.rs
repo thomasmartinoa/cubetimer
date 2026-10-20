@@ -8,6 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 
+use crate::algview;
 use crate::app::{App, Tone};
 use crate::fmt;
 use crate::font;
@@ -38,6 +39,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     if let Some(view) = &app.cube_view {
         view3d::draw(frame, area, view, &app.gfx);
+        return;
+    }
+    if let Some(browser) = &app.algs {
+        algview::draw(frame, area, browser, &app.data, app.look, &app.gfx);
         return;
     }
     if let Some(view) = &app.stats {
@@ -252,11 +257,16 @@ fn draw_stats_grid(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(spans)
         })
         .collect();
-    let (number, count) = session_position(app);
-    let title = format!(
-        " stats - {} - session {number}/{count} ",
-        app.puzzle().name()
-    );
+    let title = match &app.drill {
+        Some(d) => format!(" {} trainer - {} cases ", d.set.name(), d.cases.len()),
+        None => {
+            let (number, count) = session_position(app);
+            format!(
+                " stats - {} - session {number}/{count} ",
+                app.puzzle().name()
+            )
+        }
+    };
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(title).border_style(dim())),
         area,
@@ -265,13 +275,14 @@ fn draw_stats_grid(frame: &mut Frame, area: Rect, app: &App) {
 
 /// WCA color scheme, U R F D L B. Real cube colors rather than the terminal
 /// theme's, since they have to match the cube in your hands.
-const STICKER_COLORS: [Color; 6] = [
+pub const STICKER_COLORS: [Color; 7] = [
     Color::Rgb(245, 245, 245),
     Color::Rgb(214, 40, 40),
     Color::Rgb(0, 168, 84),
     Color::Rgb(255, 213, 0),
     Color::Rgb(255, 128, 0),
     Color::Rgb(0, 82, 204),
+    Color::Rgb(92, 92, 92),
 ];
 
 /// The scrambled cube as a net (U on top, L F R B across, D below), each
@@ -475,9 +486,13 @@ fn draw_stats_line(frame: &mut Frame, area: Rect, app: &App) {
     let prec = app.precision;
     let s = app.summary();
     let (number, count) = session_position(app);
+    let label = match &app.drill {
+        Some(d) => format!("{} trainer", d.set.name()),
+        None => app.puzzle().name().to_string(),
+    };
     let text = format!(
         "{} best {}  ao5 {}  ao12 {}  mean {}  n={}  s{number}/{count}",
-        app.puzzle().name(),
+        label,
         fmt::fmt_single(s.best, prec),
         fmt::fmt_avg(s.ao5, prec),
         fmt::fmt_avg(s.ao12, prec),
@@ -497,16 +512,21 @@ fn draw_stats_line(frame: &mut Frame, area: Rect, app: &App) {
 fn footer_text(app: &App, width: usize) -> String {
     let on = |b: bool| if b { "on" } else { "off" };
     // (priority: lower stays longer, text), in display order
-    let parts: [(u8, String); 13] = [
+    let parts: [(u8, String); 14] = [
         (1, "space go".into()),
         (6, "+/d/o mark".into()),
         (8, "bksp delete".into()),
         (7, "h history".into()),
         (7, "s stats".into()),
+        (7, "a algs".into()),
         (9, "n [ ] session".into()),
         (5, format!("i inspect:{}", on(app.inspection_on))),
         (4, format!("f font:{}", font::name_at(app.font))),
-        (4, format!("e puzzle:{}", app.puzzle().name())),
+        if app.drill.is_some() {
+            (1, "t stop training".into())
+        } else {
+            (4, format!("e puzzle:{}", app.puzzle().name()))
+        },
         (10, "p display".into()),
         (11, format!("b bell:{}", on(app.bell))),
         (3, "? help".into()),
@@ -514,7 +534,7 @@ fn footer_text(app: &App, width: usize) -> String {
     ];
     let mut order: Vec<usize> = (0..parts.len()).collect();
     order.sort_by_key(|&i| parts[i].0);
-    let mut keep = [false; 13];
+    let mut keep = [false; 14];
     let mut used = 1;
     for i in order {
         let need = parts[i].1.chars().count() + 2;
@@ -550,7 +570,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Every key, for the `?` overlay.
-const HELP: [(&str, &str); 22] = [
+const HELP: [(&str, &str); 23] = [
     ("space", "inspect, hold and release to start, stop"),
     ("any key", "stop a running solve"),
     ("esc", "cancel inspection or a hold"),
@@ -558,6 +578,7 @@ const HELP: [(&str, &str); 22] = [
     ("backspace", "delete the last solve (asks y / n)"),
     ("h", "history: browse, mark and delete any solve"),
     ("s", "statistics: chart, distribution, summary"),
+    ("a", "algorithms: PLL, OLL, F2L, with the 3D cube"),
     ("e", "choose the puzzle: 2x2 to 7x7"),
     ("v", "the scrambled cube in 3D: turn it, watch the scramble"),
     ("n", "new session"),
@@ -986,7 +1007,7 @@ mod tests {
         // a net has 54 stickers in 27 half-block cells (two per cell)...
         assert!(colored.len() >= 27, "{}", colored.len());
         // ...in all six colors
-        for c in STICKER_COLORS {
+        for &c in &STICKER_COLORS[..6] {
             assert!(colored.contains(&Some(c)), "{c:?}");
         }
         assert!(render(&app, 120, 40).contains("preview"));
@@ -1253,7 +1274,7 @@ mod tests {
     fn a_solved_net_has_n_squared_stickers_of_each_color() {
         for n in 2..=7usize {
             let grid = net_grid("U U'", n).unwrap(); // solved again
-            for color in STICKER_COLORS {
+            for &color in &STICKER_COLORS[..6] {
                 let count = grid
                     .iter()
                     .flatten()

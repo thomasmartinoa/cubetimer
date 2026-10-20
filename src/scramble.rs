@@ -27,7 +27,7 @@ fn far_enough(state: &Cube) -> bool {
 }
 
 /// The moves that take a solved cube to `state`: the inverse of a solution.
-fn scramble_for(state: &Cube) -> Vec<Move> {
+pub fn scramble_for(state: &Cube) -> Vec<Move> {
     // 21 moves always exist (any state has a 20-move solution), so this can't fail.
     let solution = twophase::solve(state, MAX_LENGTH).expect("every state has a 21-move solution");
     solution.iter().rev().map(|m| m.inverse()).collect()

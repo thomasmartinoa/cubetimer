@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::algs::{Case, Set};
+use crate::algview::{self, AlgBrowser};
 use crate::chart::Range;
 use crate::fmt::{self, Precision, RunDisplay};
 use crate::font;
@@ -18,6 +20,7 @@ use crate::scramble::Scrambler;
 use crate::stats::{self, Penalty, Summary, TimeResult};
 use crate::statsview::StatsView;
 use crate::store::{self, Data, Loaded, Session, Settings, Solve};
+use crate::trainer::Drill;
 use crate::ui;
 use crate::view3d::{CubeView, Gfx, Look};
 
@@ -108,6 +111,16 @@ pub struct App {
     pub history: Option<usize>,
     /// The key help overlay is open.
     pub show_help: bool,
+    /// The algorithm browser, when open.
+    pub algs: Option<AlgBrowser>,
+    /// The trainer, while drilling algorithms; scrambles come from it.
+    pub drill: Option<Drill>,
+    /// The case the current training scramble sets up.
+    drill_case: Option<&'static Case>,
+    /// The case of the last training solve, shown after it.
+    pub last_case: Option<&'static Case>,
+    /// The session to go back to when training stops.
+    drill_return: usize,
     /// The statistics screen, when open.
     pub stats: Option<StatsView>,
     /// The puzzle picker is open with this puzzle highlighted.
@@ -152,6 +165,11 @@ impl App {
             show_help: false,
             picker: None,
             stats: None,
+            algs: None,
+            drill: None,
+            drill_case: None,
+            last_case: None,
+            drill_return: 0,
             cube_view: None,
             gfx: Gfx::default(),
             look: Look::default(),
@@ -184,6 +202,17 @@ impl App {
         self.inspection_on = settings.inspection;
         self.bell = settings.bell;
         self.look = Look::from_name(&settings.look);
+        // a run that ended while training restarts in a normal session
+        if self.data.sessions[self.data.current].drill.is_some() {
+            let puzzle = self.puzzle();
+            self.data.current = match self.data.sessions_of(puzzle).last() {
+                Some(&i) => i,
+                None => {
+                    self.data.sessions.push(Session::new(puzzle));
+                    self.data.sessions.len() - 1
+                }
+            };
+        }
         self.reset_scrambler();
         self
     }
@@ -221,7 +250,7 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         let mut mouse = false;
         while !self.quit {
-            if self.cube_view.is_some() {
+            if self.cube_view.is_some() || self.algs.is_some() {
                 // ask the terminal about images once, before drawing the first image
                 self.gfx.ensure_picker();
             }
@@ -313,6 +342,12 @@ impl App {
                 }
                 return;
             }
+            if let Some(browser) = self.algs.as_mut() {
+                if AlgBrowser::repeats(code) {
+                    browser.key(code);
+                }
+                return;
+            }
             // ...and otherwise only scrolls the history list.
             let scrolls = matches!(
                 code,
@@ -362,6 +397,42 @@ impl App {
             }
             return;
         }
+        if let Some(browser) = self.algs.as_mut() {
+            match browser.key(code) {
+                algview::Action::None => {}
+                algview::Action::Close => self.algs = None,
+                algview::Action::Train(set) => {
+                    self.algs = None;
+                    self.start_drill(set);
+                }
+                algview::Action::Show(case) => {
+                    let steps = crate::alg::steps(case.alg).unwrap_or_default();
+                    let title = format!("{}   {}", case.title(), case.alg);
+                    self.gfx.ensure_picker();
+                    let mut view = CubeView::for_steps(title, algview::start_cube(case), steps);
+                    view.has_images = self.gfx.has_images();
+                    view.look = match self.look {
+                        Look::Image if !view.has_images => Look::Blocks,
+                        look => look,
+                    };
+                    self.cube_view = Some(view);
+                }
+                algview::Action::Mark(case) => {
+                    let key = case.key();
+                    let now = self
+                        .data
+                        .progress
+                        .get(&key)
+                        .map_or(algview::Progress::New, |s| algview::Progress::from_name(s));
+                    match now.next() {
+                        algview::Progress::New => self.data.progress.remove(&key),
+                        next => self.data.progress.insert(key, next.name().into()),
+                    };
+                    self.persist();
+                }
+            }
+            return;
+        }
         if let Some(selected) = self.picker {
             self.picker_key(code, selected);
             return;
@@ -398,6 +469,9 @@ impl App {
             KeyCode::Char('h') if idle => self.history = last,
             // `/` too: WezTerm sends Shift+/ without the SHIFT flag
             KeyCode::Char('?' | '/') | KeyCode::F(1) if idle => self.show_help = true,
+            // while training: t stops, and sessions and puzzles stay put
+            KeyCode::Char('t') if idle && self.drill.is_some() => self.stop_drill(),
+            KeyCode::Char('e' | 'n' | 'X' | '[' | ']') if self.drill.is_some() => {}
             KeyCode::Char('e') if idle => {
                 self.picker = Some(
                     puzzle::ALL
@@ -408,6 +482,7 @@ impl App {
             }
             KeyCode::Char('v') if idle => self.open_cube_view(None),
             KeyCode::Char('s') if idle => self.stats = Some(StatsView::new(self)),
+            KeyCode::Char('a') if idle => self.algs = Some(AlgBrowser::default()),
             KeyCode::Char('n') if idle => self.new_session(),
             KeyCode::Char('X') if idle => self.confirm_session_delete = true,
             KeyCode::Char('[') if idle => self.switch_session(-1),
@@ -482,7 +557,9 @@ impl App {
     fn stop(&mut self, now: Instant) {
         if let State::Running { start, penalty } = self.state {
             let ms = now.duration_since(start).as_millis() as u64;
-            let solve = Solve::new(ms, penalty, self.scramble.clone());
+            let mut solve = Solve::new(ms, penalty, self.scramble.clone());
+            solve.case = self.drill_case.map(Case::key);
+            self.last_case = self.drill_case.take();
             // Only a beaten best counts, so the first solve doesn't flash.
             let new_pb = matches!(
                 (stats::best(&self.results()), solve.result()),
@@ -490,7 +567,8 @@ impl App {
             );
             self.pb_flash = new_pb.then_some(now);
             self.data.solves_mut().push(solve);
-            self.scramble = self.scrambler.try_next().unwrap_or_default();
+            self.scramble.clear();
+            self.next_scramble();
             self.state = State::Idle;
             self.persist();
         }
@@ -518,6 +596,45 @@ impl App {
         // keep the browser on a solve that still exists
         let len = self.solves().len();
         self.history = self.history.filter(|_| len > 0).map(|i| i.min(len - 1));
+    }
+
+    /// Take the next scramble from the trainer or the scrambler, if ready.
+    fn next_scramble(&mut self) {
+        if let Some(drill) = &self.drill {
+            if let Some((case, scramble)) = drill.try_next() {
+                self.drill_case = Some(case);
+                self.scramble = scramble;
+            }
+        } else if let Some(s) = self.scrambler.try_next() {
+            self.scramble = s;
+        }
+    }
+
+    /// Start drilling `set`: the cases marked as being learned, or all of
+    /// them, in the set's own session.
+    fn start_drill(&mut self, set: Set) {
+        let progress = &self.data.progress;
+        let cases = Drill::cases_for(set, |c| {
+            progress.get(&c.key()).map(String::as_str) == Some("learning")
+        });
+        self.drill_return = self.data.current;
+        self.data.current = self.data.drill_session(set.name());
+        self.drill = Some(Drill::new(set, cases));
+        self.drill_case = None;
+        self.last_case = None;
+        self.history = None;
+        self.scramble.clear();
+        self.next_scramble();
+        self.persist();
+    }
+
+    fn stop_drill(&mut self) {
+        self.drill = None;
+        self.drill_case = None;
+        self.last_case = None;
+        self.data.current = self.drill_return.min(self.data.sessions.len() - 1);
+        self.reset_scrambler();
+        self.persist();
     }
 
     /// Open the cube view for the current scramble, or for solve `solve`.
@@ -657,10 +774,8 @@ impl App {
         if let Some(view) = self.cube_view.as_mut() {
             view.tick(now);
         }
-        if self.scramble.is_empty()
-            && let Some(s) = self.scrambler.try_next()
-        {
-            self.scramble = s;
+        if self.scramble.is_empty() {
+            self.next_scramble();
         }
         if self
             .pb_flash
@@ -738,10 +853,16 @@ impl App {
                     (true, false) => "hold space, release to start",
                     (false, false) => "space: start",
                 };
+                // while training, say which case the last solve was
+                let hint = match (&self.drill, self.last_case) {
+                    (Some(_), Some(case)) => format!("that was {}:  {}", case.title(), case.alg),
+                    (Some(d), None) => format!("{} trainer: {}", d.set.name(), hint),
+                    _ => hint.into(),
+                };
                 View {
                     text,
                     tone: Tone::Idle,
-                    hint: hint.into(),
+                    hint,
                 }
             }
             State::Inspection { start } => {
@@ -1884,9 +2005,9 @@ mod tests {
         settle(&mut app);
         key(&mut app, KeyCode::Char('v'));
         let view = app.cube_view.as_ref().expect("open");
-        assert_eq!(view.size, 3);
+        assert_eq!(view.player.frame(Instant::now()).0.size(), 3);
         assert_eq!(
-            view.player.moves().len(),
+            view.player.steps().len(),
             crate::nxn::parse(&app.scramble).unwrap().len()
         );
         // space plays the scramble instead of starting inspection
@@ -1934,7 +2055,7 @@ mod tests {
         key(&mut app, KeyCode::Char('v'));
         let view = app.cube_view.as_ref().unwrap();
         assert_eq!(view.title, "3x3 solve 1 scramble");
-        assert_eq!(view.player.moves().len(), 3);
+        assert_eq!(view.player.steps().len(), 3);
         key(&mut app, KeyCode::Esc);
         assert!(app.cube_view.is_none());
         assert_eq!(app.history, Some(0), "back in the history browser");
@@ -2068,6 +2189,186 @@ mod tests {
         loaded.data.settings.look = "from-a-newer-version".into();
         let app = App::new(true).with_storage(PathBuf::from("/nonexistent/sessions.json"), loaded);
         assert_eq!(app.look, Look::default());
+    }
+
+    #[test]
+    fn a_opens_the_algorithm_browser_and_enter_shows_the_case_in_3d() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('a'));
+        assert!(app.algs.is_some());
+        // T-perm is the 16th PLL
+        for _ in 0..15 {
+            key(&mut app, KeyCode::Right);
+        }
+        assert_eq!(app.algs.as_ref().unwrap().case().name, "T");
+        key(&mut app, KeyCode::Enter);
+        let view = app.cube_view.as_ref().expect("the 3D view opens");
+        assert!(view.title.starts_with("T-perm"));
+        assert_eq!(view.player.pos(), 0, "it starts at the case, not the end");
+        let labels: Vec<&str> = view
+            .player
+            .steps()
+            .iter()
+            .map(|s| s.label.as_str())
+            .collect();
+        assert_eq!(labels.join(" "), "R U R' U' R' F R2 U' R' U' R U R' F'");
+        // playing it to the end solves the case
+        key(&mut app, KeyCode::End);
+        let (cube, _) = app.cube_view.as_ref().unwrap().player.frame(Instant::now());
+        let f = cube.facelets();
+        assert!(
+            (0..6).all(|k| f[k * 9..k * 9 + 9].iter().all(|&c| c == f[k * 9 + 4])),
+            "solved"
+        );
+        // closing the view goes back to the browser, not the timer
+        key(&mut app, KeyCode::Esc);
+        assert!(app.cube_view.is_none());
+        assert!(app.algs.is_some());
+        key(&mut app, KeyCode::Esc);
+        assert!(app.algs.is_none());
+    }
+
+    #[test]
+    fn marks_cycle_and_are_saved() {
+        let dir = std::env::temp_dir().join(format!("cubetimer-marks-test-{}", std::process::id()));
+        let path = dir.join("sessions.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new(true).with_storage(path.clone(), store::load(&path));
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('m'));
+        assert_eq!(
+            app.data.progress.get("PLL:Aa").map(String::as_str),
+            Some("learning")
+        );
+        key(&mut app, KeyCode::Char('m'));
+        assert_eq!(
+            app.data.progress.get("PLL:Aa").map(String::as_str),
+            Some("learned")
+        );
+        let again = store::load(&path).data;
+        assert_eq!(
+            again.progress.get("PLL:Aa").map(String::as_str),
+            Some("learned")
+        );
+        // a third press goes back to new, which isn't stored at all
+        key(&mut app, KeyCode::Char('m'));
+        assert!(app.data.progress.is_empty());
+        assert!(store::load(&path).data.progress.is_empty());
+    }
+
+    #[test]
+    fn browser_keys_do_not_leak_to_the_timer() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('a'));
+        for k in [
+            KeyCode::Char('d'),
+            KeyCode::Char('h'),
+            KeyCode::Char('s'),
+            KeyCode::Char('n'),
+        ] {
+            key(&mut app, k);
+        }
+        assert_eq!(app.solves()[0].penalty, Penalty::Ok);
+        assert!(app.history.is_none() && app.stats.is_none());
+        assert_eq!(app.data.sessions.len(), 1);
+        key(&mut app, KeyCode::Char('q'));
+        assert!(
+            app.algs.is_none() && !app.quit,
+            "q closes the browser, not the app"
+        );
+    }
+
+    #[test]
+    fn holding_an_arrow_moves_through_the_cases() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('a'));
+        let t = Instant::now();
+        app.on_key(press(KeyCode::Right), t);
+        app.on_key(press(KeyCode::Right), t); // repeat as a press
+        let rep = KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::NONE, KeyEventKind::Repeat);
+        app.on_key(rep, t);
+        assert_eq!(app.algs.as_ref().unwrap().selected, 3);
+    }
+
+    #[test]
+    fn training_drills_cases_in_their_own_session_and_t_stops_it() {
+        let t = Instant::now();
+        let mut app = with_solves(&[9_000]);
+        app.inspection_on = false;
+        // mark two PLLs as learning, then train PLL from the browser
+        app.data.progress.insert("PLL:T".into(), "learning".into());
+        app.data.progress.insert("PLL:Y".into(), "learning".into());
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('t'));
+        assert!(app.algs.is_none(), "the browser closes");
+        let drill = app.drill.as_ref().expect("training");
+        assert_eq!(
+            drill.cases.iter().map(|c| c.name).collect::<Vec<_>>(),
+            ["T", "Y"]
+        );
+        assert_eq!(
+            app.data.sessions[app.data.current].drill.as_deref(),
+            Some("PLL")
+        );
+        assert!(app.solves().is_empty(), "a fresh drill session");
+        settle(&mut app);
+        let case = app.drill_case.expect("the scramble's case");
+        assert!(["T", "Y"].contains(&case.name));
+        // a solve is tagged with its case, and the hint names it
+        solve_at(&mut app, t, 2_000);
+        assert_eq!(app.solves()[0].case, Some(case.key()));
+        let hint = app.view(Instant::now()).hint;
+        assert!(
+            hint.starts_with(&format!("that was {}", case.title())),
+            "{hint}"
+        );
+        // sessions and puzzles stay put while training
+        for k in ['n', 'e', '[', ']'] {
+            key(&mut app, KeyCode::Char(k));
+        }
+        assert!(app.picker.is_none());
+        assert_eq!(
+            app.data.sessions[app.data.current].drill.as_deref(),
+            Some("PLL")
+        );
+        // t stops and goes back to the normal session
+        key(&mut app, KeyCode::Char('t'));
+        assert!(app.drill.is_none());
+        assert_eq!(app.solves()[0].ms, 9_000);
+        assert!(app.solves()[0].case.is_none());
+        settle(&mut app);
+        assert!(
+            crate::nxn::parse(&app.scramble).is_some(),
+            "normal scrambles again"
+        );
+    }
+
+    #[test]
+    fn training_with_nothing_marked_drills_the_whole_set() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Tab); // OLL
+        key(&mut app, KeyCode::Char('t'));
+        let drill = app.drill.as_ref().unwrap();
+        assert_eq!((drill.set, drill.cases.len()), (Set::Oll, 57));
+    }
+
+    #[test]
+    fn a_run_saved_while_training_restarts_in_a_normal_session() {
+        let dir = std::env::temp_dir().join(format!("cubetimer-drill-test-{}", std::process::id()));
+        let path = dir.join("sessions.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new(true).with_storage(path.clone(), store::load(&path));
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('t'));
+        assert!(app.drill.is_some());
+        // quit without stopping: the file says we were in the drill session
+        let saved = store::load(&path).data;
+        assert!(saved.sessions[saved.current].drill.is_some());
+        let again = App::new(true).with_storage(path.clone(), store::load(&path));
+        assert!(again.drill.is_none());
+        assert!(again.data.sessions[again.data.current].drill.is_none());
+        assert_eq!(again.puzzle(), Puzzle::Cube3);
     }
 }
 
