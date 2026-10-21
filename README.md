@@ -47,7 +47,7 @@ the clipboard, CSV export, and import from csTimer.
 Arch Linux (AUR):
 
 ```sh
-yay -S cubetimer
+COMING SOON
 ```
 
 From source (Rust 1.90 or newer):
