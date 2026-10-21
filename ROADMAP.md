@@ -199,7 +199,7 @@ drill the cases you are learning.
 trainer's scrambles always produce the chosen case. Suggested model: Sonnet (the tests
 catch wrong algorithms; switch to Opus if the case-coverage checks are hard to satisfy).
 
-## Phase 5: everyday improvements — `feat/qol`
+## Phase 5: everyday improvements — `feat/qol` — done (merged into dev)
 
 - **Settings screen** (`,`): hold time (0 to 1 s, now fixed at 0.3 s), inspection per
   puzzle, 0.01 or 0.001 precision, the bell, and the font.

@@ -57,6 +57,14 @@ already run.
 - **Fits any window.** If the font you picked doesn't fit, the next smaller one is used,
   and the layout shrinks to a few text lines in very small windows.
 - **Remembers your setup.** The font, inspection and bell settings are saved.
+- **Settings.** `,` opens a settings screen: hold time (0 to 1 s, default 0.3 s), inspection,
+  0.01 or 0.001 precision, the bell, the digit font and the 3D look. Everything is saved.
+- **Names, comments, clipboard.** `r` names the session ("one-handed"), `c` in the history
+  comments a solve, and `y` copies the scramble (in the history, the selected solve; in the
+  statistics, the last ao5, or `Y` for ao12 written out as
+  `(12.10) 13.20 14.00 13.80 (16.43) = 13.67`) to the clipboard through the terminal.
+- **csTimer import.** `cubetimer --import export.txt` adds a csTimer export, with its
+  sessions, puzzles, penalties, comments and dates.
 - **Safe with your data.** Saves are atomic, a damaged file is set aside instead of
   overwritten, only one copy can run at a time, and the terminal is restored however the
   program ends (quit, crash, `kill`, closed window).
@@ -106,6 +114,9 @@ kitty --start-as=fullscreen cubetimer
 | `Backspace` | Delete the last solve (asks `y` / `n`) |
 | `h` | History: browse, mark and delete any solve |
 | `s` | Statistics: chart, distribution and summary (`r` or `1`-`4` change the range, `Esc` closes) |
+| `,` | Settings: hold time, inspection, precision, bell, font, 3D look |
+| `r` | Name the current session (empty clears it) |
+| `y` | Copy the scramble to the clipboard (`Y` in the statistics: the ao5 / ao12 written out) |
 | `a` | Algorithms: PLL, OLL, F2L and 2-look, with the 3D cube and the trainer |
 | `t` | Stop training (while the trainer is on) |
 | `e` | Choose the puzzle: 2x2, 3x3, 4x4, 5x5, 6x6 or 7x7 (`2`-`7` jump straight to one) |
@@ -126,7 +137,22 @@ The font, `p` and bell keys work any time except while the clock is running, whe
 stops it.
 
 In the history browser, `↑`/`↓` (or `k`/`j`), `PgUp`/`PgDn` and `Home`/`End` move, `+` `d`
-`o` mark the selected solve, `Backspace` deletes it (asks first) and `Esc` closes.
+`o` mark the selected solve, `c` adds a comment, `y` copies it, `v` shows its scramble in
+3D, `Backspace` deletes it (asks first) and `Esc` closes.
+
+**Importing from csTimer.** In csTimer use Export, "To file". Then:
+
+```sh
+cubetimer --import cstimer.txt --dry-run   # say what would be imported
+cubetimer --import cstimer.txt             # add the sessions
+```
+
+Each csTimer session becomes a cubetimer session of the right puzzle (2x2 to 7x7), with its
+name, penalties (+2 and DNF), scrambles, comments and dates. Sessions of other puzzles
+(Pyraminx, Skewb, ...) are skipped and listed. Importing adds to what you have and never
+changes it, but importing the same file twice adds the sessions twice. Close the timer
+first: the import refuses to run while it is open, so two programs never write your solves
+at once.
 
 `cubetimer --help` and `cubetimer --version` work as usual. `cubetimer --export > solves.csv`
 saves every solve as CSV, one row each: session, number, time, penalty, result, scramble
@@ -361,9 +387,8 @@ The first line should say `keyboard enhancement: ON`.
 - One algorithm per case, and only CFOP (no ZBLL, COLL or other methods). The trainer
   assumes a white cross and a yellow last layer.
 - 4x4 scrambles are random-move, not random-state.
-- No import from csTimer or other timers (export to CSV is supported), no session names,
-  and no Bluetooth smart cubes.
-- The hold time before the timer is ready is fixed at 0.3 s.
+- No import from timers other than csTimer (export to CSV is supported), and no Bluetooth
+  smart cubes.
 - The scramble preview and the 3D view use true color (24-bit), which every terminal
   listed above supports.
 - The 3D view hasn't been tried inside tmux.
@@ -383,7 +408,7 @@ table), `puzzle.rs`, `scramble.rs`, `fmt.rs` (time formatting), `stats.rs` (aver
 (digit fonts), `store.rs` (sessions on disk), `app.rs` (state machine), `ui.rs`
 (drawing), `render3d.rs` (the 3D renderer), `anim.rs` (playing moves), `view3d.rs` (the 3D
 view), `chart.rs` (axis ticks, outliers, histograms), `statsview.rs` (the statistics
-screen and the chart), `alg.rs` (algorithm notation), `algs.rs` (the algorithm library and
+screen and the chart), `import.rs` (csTimer files), `alg.rs` (algorithm notation), `algs.rs` (the algorithm library and
 its checks), `algview.rs` (the browser) and `trainer.rs`. `term.rs` owns raw mode and the keyboard protocol, and restores the terminal on
 exit, on panic and on signals.
 

@@ -203,6 +203,23 @@ except Exception as e:
     tagged = False
 check("the training solve is saved with its case", bool(tagged))
 
+# Settings, names and the clipboard: a typed name is saved, the settings
+# screen opens, and y sends an OSC 52 clipboard sequence to the terminal.
+pid9, fd9 = spawn("xterm-256color")
+pump(fd9, 2.5)
+os.write(fd9, b",")
+check(", opens the settings screen", "hold time" in text(pump(fd9, 0.6)))
+os.write(fd9, b"\x1b")
+pump(fd9, 0.3)
+os.write(fd9, b"rwarm-up\r")
+named = text(pump(fd9, 0.6))
+check("r names the session", '"warm-up"' in named)
+os.write(fd9, b"y")
+copied = pump(fd9, 0.6)
+check("y copies the scramble with OSC 52", b"\x1b]52;c;" in copied)
+os.write(fd9, b"q")
+check("q quits after settings and copying", wait_exit(pid9) == 0)
+
 # Mouse: reporting is on only while the cube view is open, and a drag turns
 # the cube (SGR mouse sequences, as kitty, foot, Ghostty and WezTerm send).
 pid6, fd6 = spawn()

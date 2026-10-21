@@ -26,6 +26,11 @@
 - A trainer for any set: scrambles that set up the cases you are learning (uniformly, with
   random top-layer turns), solves tagged with their case in a separate session, and your
   count, mean and best per case in the browser.
+- Settings screen (`,`) with a configurable hold time, 0.001 precision, inspection, bell,
+  font and 3D look, all saved.
+- Session names (`r`), solve comments (`c` in the history), and copying to the clipboard
+  (`y`) with the ao5 and ao12 written out with their dropped times in brackets.
+- `--import` reads a csTimer export (with `--dry-run`).
 - Building from source now needs Rust 1.90 (a dependency of the image support requires it).
 
 ## 0.1.0

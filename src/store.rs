@@ -27,6 +27,9 @@ pub struct Solve {
     /// solves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub case: Option<String>,
+    /// A note on the solve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 impl Solve {
@@ -40,6 +43,7 @@ impl Solve {
             scramble,
             ts,
             case: None,
+            comment: None,
         }
     }
 
@@ -59,6 +63,9 @@ pub struct Session {
     /// sessions are kept apart from normal ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drill: Option<String>,
+    /// A name for the session ("one-handed", "warm-up").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 fn default_puzzle_id() -> String {
@@ -77,6 +84,7 @@ impl Session {
             solves: Vec::new(),
             puzzle: puzzle.id().into(),
             drill: None,
+            name: None,
         }
     }
 
@@ -95,6 +103,10 @@ pub struct Settings {
     pub bell: bool,
     /// How the 3D cube is drawn, see `view3d::Look`.
     pub look: String,
+    /// How long space is held before the timer is ready, in milliseconds.
+    pub hold_ms: u64,
+    /// Show times to the thousandth.
+    pub milli: bool,
 }
 
 impl Default for Settings {
@@ -104,6 +116,8 @@ impl Default for Settings {
             inspection: true,
             bell: false,
             look: crate::view3d::Look::default().name().into(),
+            hold_ms: 300,
+            milli: false,
         }
     }
 }
@@ -327,6 +341,7 @@ mod tests {
             scramble: "R U".into(),
             ts: 7,
             case: None,
+            comment: None,
         });
         data.solves_mut().push(Solve {
             ms: 9_990,
@@ -334,6 +349,7 @@ mod tests {
             scramble: "F2".into(),
             ts: 8,
             case: None,
+            comment: None,
         });
         data.sessions.push(Session::default());
         data.current = 1;
@@ -389,6 +405,8 @@ mod tests {
             inspection: false,
             bell: true,
             look: "ascii".into(),
+            hold_ms: 150,
+            milli: true,
         };
         save(&path, &data).unwrap();
         assert_eq!(load(&path).data.settings, data.settings);
@@ -430,6 +448,7 @@ mod tests {
             scramble: "a,\"b\"".into(),
             ts: 0,
             case: None,
+            comment: None,
         });
         assert!(to_csv(&data).contains(",0.005,\"a,\"\"b\"\"\","));
     }
@@ -515,6 +534,7 @@ mod tests {
             solves: vec![],
             puzzle: "from-the-future".into(),
             drill: None,
+            name: None,
         });
         save(&path, &data).unwrap();
         let back = read(&path).unwrap();
@@ -537,6 +557,7 @@ mod tests {
             scramble: "Rw".into(),
             ts: 0,
             case: None,
+            comment: None,
         });
         assert!(to_csv(&data).contains("\n2,4x4,1,50.000,ok,50.000,Rw,"));
     }

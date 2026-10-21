@@ -133,6 +133,45 @@ pub fn summarize(results: &[TimeResult]) -> Summary {
     }
 }
 
+/// An average written out the way it is posted: the dropped times in
+/// brackets, then the mean. `(12.10) 13.20 14.00 13.80 (16.43) = 13.67`.
+/// `None` when there aren't `n` solves. Times are in the order they were
+/// solved; DNFs show as `DNF`.
+pub fn ao_details(results: &[TimeResult], n: usize, prec: crate::fmt::Precision) -> Option<String> {
+    use crate::fmt;
+    let avg = ao(results, n)?;
+    let window = &results[results.len() - n..];
+    // drop the best and worst by position, so equal times drop one each
+    let trim = trim_count(n);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| (window[i], i));
+    let dropped: Vec<usize> = order[..trim]
+        .iter()
+        .chain(&order[n - trim..])
+        .copied()
+        .collect();
+    let show = |r: &TimeResult| match r {
+        TimeResult::Ms(ms) => fmt::fmt_time(*ms, prec),
+        TimeResult::Dnf => "DNF".to_string(),
+    };
+    let parts: Vec<String> = window
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            if dropped.contains(&i) {
+                format!("({})", show(r))
+            } else {
+                show(r)
+            }
+        })
+        .collect();
+    Some(format!(
+        "{} = {}",
+        parts.join(" "),
+        fmt::fmt_avg(Some(avg), prec)
+    ))
+}
+
 /// The averages the statistics screen lists.
 pub const REPORT_AVERAGES: [usize; 5] = [5, 12, 50, 100, 1000];
 
@@ -357,5 +396,31 @@ mod tests {
             start.elapsed()
         );
         assert!(r.averages.iter().all(|a| a.1.is_some() && a.2.is_some()));
+    }
+
+    #[test]
+    fn average_details_bracket_the_dropped_times() {
+        use crate::fmt::Precision::Centi;
+        let r = [Ms(12_100), Ms(13_200), Ms(14_000), Ms(13_800), Ms(16_430)];
+        assert_eq!(
+            ao_details(&r, 5, Centi).unwrap(),
+            "(12.10) 13.20 14.00 13.80 (16.43) = 13.67"
+        );
+        // only the last n solves, in order; a DNF is the dropped worst
+        let r = [Ms(1), Ms(10_000), Ms(11_000), Dnf, Ms(9_000), Ms(12_000)];
+        assert_eq!(
+            ao_details(&r, 5, Centi).unwrap(),
+            "10.00 11.00 (DNF) (9.00) 12.00 = 11.00"
+        );
+        // equal times drop one of each
+        let r = [Ms(5_000); 5];
+        assert_eq!(
+            ao_details(&r, 5, Centi).unwrap(),
+            "(5.00) 5.00 5.00 5.00 (5.00) = 5.00"
+        );
+        assert!(ao_details(&r[..4], 5, Centi).is_none());
+        // too many DNFs
+        let r = [Ms(1000), Ms(2000), Ms(3000), Dnf, Dnf];
+        assert!(ao_details(&r, 5, Centi).unwrap().ends_with("= DNF"));
     }
 }

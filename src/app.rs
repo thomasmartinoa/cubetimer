@@ -25,6 +25,7 @@ use crate::ui;
 use crate::view3d::{CubeView, Gfx, Look};
 
 /// How long space must be held before the timer is ready.
+/// The default hold time; the setting overrides it.
 pub const HOLD_READY: Duration = Duration::from_millis(300);
 
 /// How long a new personal best flashes, and how fast it blinks.
@@ -96,6 +97,25 @@ fn key_code_is_look(code: KeyCode) -> bool {
     code == KeyCode::Char('m')
 }
 
+/// What a line of typed text is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputKind {
+    SessionName,
+    /// The solve (an index into the session) being commented.
+    Comment(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextInput {
+    pub kind: InputKind,
+    pub text: String,
+}
+
+/// The longest hold time the settings allow.
+pub const MAX_HOLD_MS: u64 = 1000;
+/// The longest name or comment.
+const MAX_TEXT: usize = 80;
+
 pub struct App {
     pub state: State,
     pub data: Data,
@@ -141,6 +161,14 @@ pub struct App {
     pub enhanced: bool,
     pub run_display: RunDisplay,
     pub precision: Precision,
+    /// How long space is held before the timer is ready.
+    pub hold: Duration,
+    /// The settings screen, with the selected row.
+    pub settings_row: Option<usize>,
+    /// A line of text being typed (a session name or a solve comment).
+    pub input: Option<TextInput>,
+    /// Text to put on the clipboard with the next frame (OSC 52).
+    pub pending_copy: Option<String>,
     pub bell: bool,
     /// The digit font choice (0 is `auto`), see `font::name_at`.
     pub font: usize,
@@ -179,6 +207,10 @@ impl App {
             enhanced,
             run_display: RunDisplay::default(),
             precision: Precision::default(),
+            hold: HOLD_READY,
+            settings_row: None,
+            input: None,
+            pending_copy: None,
             bell: false,
             font: font::index_of(font::DEFAULT),
             scramble: String::new(),
@@ -202,6 +234,12 @@ impl App {
         self.inspection_on = settings.inspection;
         self.bell = settings.bell;
         self.look = Look::from_name(&settings.look);
+        self.hold = Duration::from_millis(settings.hold_ms.min(MAX_HOLD_MS));
+        self.precision = if settings.milli {
+            Precision::Milli
+        } else {
+            Precision::Centi
+        };
         // a run that ended while training restarts in a normal session
         if self.data.sessions[self.data.current].drill.is_some() {
             let puzzle = self.puzzle();
@@ -239,6 +277,8 @@ impl App {
             inspection: self.inspection_on,
             bell: self.bell,
             look: self.look.name().into(),
+            hold_ms: self.hold.as_millis() as u64,
+            milli: self.precision == Precision::Milli,
         };
         if let Some(path) = &self.path
             && let Err(e) = store::save(path, &self.data)
@@ -260,6 +300,9 @@ impl App {
                 crate::term::set_mouse(mouse)?;
             }
             terminal.draw(|f| ui::draw(f, self))?;
+            if let Some(text) = self.pending_copy.take() {
+                write_clipboard(&text)?;
+            }
             if let Some(t) = self.tick_interval()
                 && !event::poll(t)?
             {
@@ -397,6 +440,22 @@ impl App {
             }
             return;
         }
+        if let Some(input) = self.input.as_mut() {
+            match code {
+                KeyCode::Enter => self.commit_input(),
+                KeyCode::Esc => self.input = None,
+                KeyCode::Backspace => {
+                    input.text.pop();
+                }
+                KeyCode::Char(c) if input.text.chars().count() < MAX_TEXT => input.text.push(c),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(row) = self.settings_row {
+            self.settings_key(code, row);
+            return;
+        }
         if let Some(browser) = self.algs.as_mut() {
             match browser.key(code) {
                 algview::Action::None => {}
@@ -443,6 +502,15 @@ impl App {
                 KeyCode::Char(c @ '1'..='4') => {
                     view.range = Range::ALL[c.to_digit(10).unwrap_or(1) as usize - 1];
                 }
+                // y copies the last ao5 written out, Y the last ao12
+                KeyCode::Char(c @ ('y' | 'Y')) => {
+                    let n = if c == 'y' { 5 } else { 12 };
+                    let text = stats::ao_details(&self.results(), n, self.precision);
+                    match text {
+                        Some(t) => self.copy(t),
+                        None => self.status = Some(format!("not enough solves for an ao{n}")),
+                    }
+                }
                 KeyCode::Esc | KeyCode::Char('s' | 'q') => self.stats = None,
                 _ => {}
             }
@@ -487,6 +555,20 @@ impl App {
             KeyCode::Char('X') if idle => self.confirm_session_delete = true,
             KeyCode::Char('[') if idle => self.switch_session(-1),
             KeyCode::Char(']') if idle => self.switch_session(1),
+            KeyCode::Char(',') if idle => self.settings_row = Some(0),
+            KeyCode::Char('r') if idle && self.drill.is_none() => {
+                let name = self.data.sessions[self.data.current]
+                    .name
+                    .clone()
+                    .unwrap_or_default();
+                self.input = Some(TextInput {
+                    kind: InputKind::SessionName,
+                    text: name,
+                });
+            }
+            KeyCode::Char('y') if idle && !self.scramble.is_empty() => {
+                self.copy(self.scramble.clone());
+            }
             KeyCode::Char('p') => self.run_display = self.run_display.next(),
             KeyCode::Char('b') => {
                 self.bell = !self.bell;
@@ -523,7 +605,7 @@ impl App {
 
     fn space_release(&mut self, now: Instant) {
         if let State::Holding { since, inspection } = self.state {
-            self.state = if now.duration_since(since) >= HOLD_READY {
+            self.state = if now.duration_since(since) >= self.hold {
                 Self::running(now, inspection)
             } else {
                 match inspection {
@@ -572,6 +654,67 @@ impl App {
             self.state = State::Idle;
             self.persist();
         }
+    }
+
+    /// Put `text` on the clipboard (through the terminal, OSC 52) and say so.
+    pub fn copy(&mut self, text: String) {
+        self.status = Some(format!("copied: {}", ellipsis(&text, 40)));
+        self.pending_copy = Some(text);
+    }
+
+    /// Finish typing: save the name or comment (empty clears it).
+    fn commit_input(&mut self) {
+        let Some(input) = self.input.take() else {
+            return;
+        };
+        let text = input.text.trim().to_string();
+        let value = (!text.is_empty()).then_some(text);
+        match input.kind {
+            InputKind::SessionName => self.data.sessions[self.data.current].name = value,
+            InputKind::Comment(i) => {
+                if let Some(solve) = self.data.solves_mut().get_mut(i) {
+                    solve.comment = value;
+                }
+            }
+        }
+        self.persist();
+    }
+
+    /// Rows of the settings screen.
+    pub const SETTINGS_ROWS: usize = 6;
+
+    /// Keys on the settings screen: up/down pick a row, left/right change it.
+    fn settings_key(&mut self, code: KeyCode, row: usize) {
+        let last = Self::SETTINGS_ROWS - 1;
+        match code {
+            KeyCode::Esc | KeyCode::Char(',' | 'q') => self.settings_row = None,
+            KeyCode::Up | KeyCode::Char('k') => self.settings_row = Some(row.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => self.settings_row = Some((row + 1).min(last)),
+            KeyCode::Left | KeyCode::Char('h') => self.adjust(row, -1),
+            KeyCode::Right | KeyCode::Char('l' | ' ') | KeyCode::Enter => self.adjust(row, 1),
+            _ => {}
+        }
+    }
+
+    /// Change setting `row` one step (-1 or 1).
+    fn adjust(&mut self, row: usize, step: i64) {
+        match row {
+            0 => {
+                let ms = (self.hold.as_millis() as i64 + step * 50).clamp(0, MAX_HOLD_MS as i64);
+                self.hold = Duration::from_millis(ms as u64);
+            }
+            1 => self.inspection_on = !self.inspection_on,
+            2 => {
+                self.precision = match self.precision {
+                    Precision::Centi => Precision::Milli,
+                    Precision::Milli => Precision::Centi,
+                }
+            }
+            3 => self.bell = !self.bell,
+            4 => self.cycle_font(step as isize),
+            _ => self.look = self.look.next(self.gfx.has_images()),
+        }
+        self.persist();
     }
 
     /// Switch to the next (or previous) digit font and remember it.
@@ -680,6 +823,23 @@ impl App {
             KeyCode::Char('o') => self.mark(Some(selected), Penalty::Ok),
             KeyCode::Backspace | KeyCode::Delete => self.confirm_delete = Some(selected),
             KeyCode::Char('v') => self.open_cube_view(Some(selected)),
+            KeyCode::Char('c') => {
+                let text = self.solves().get(selected).and_then(|s| s.comment.clone());
+                self.input = Some(TextInput {
+                    kind: InputKind::Comment(selected),
+                    text: text.unwrap_or_default(),
+                });
+            }
+            KeyCode::Char('y') => {
+                if let Some(solve) = self.solves().get(selected) {
+                    let line = format!(
+                        "{}  {}",
+                        fmt::fmt_solve_list(solve.ms, solve.penalty, self.precision),
+                        solve.scramble
+                    );
+                    self.copy(line);
+                }
+            }
             KeyCode::Esc | KeyCode::Char('h' | 'q') => self.history = None,
             _ => {}
         }
@@ -880,7 +1040,7 @@ impl App {
                 }
             }
             State::Holding { since, inspection } => {
-                let ready = now.duration_since(since) >= HOLD_READY;
+                let ready = now.duration_since(since) >= self.hold;
                 let text = match inspection {
                     Some(start) => {
                         fmt::fmt_inspection(now.duration_since(start).as_millis() as u64)
@@ -2370,6 +2530,213 @@ mod tests {
         assert!(again.data.sessions[again.data.current].drill.is_none());
         assert_eq!(again.puzzle(), Puzzle::Cube3);
     }
+
+    #[test]
+    fn the_hold_time_setting_changes_when_the_timer_is_ready() {
+        let t = Instant::now();
+        let mut app = App::new(true);
+        app.inspection_on = false;
+        app.hold = Duration::from_millis(600);
+        app.on_key(press(SPACE), t);
+        app.on_key(release(SPACE), at(t, 500)); // too early for 600 ms
+        assert_eq!(app.state, State::Idle);
+        app.on_key(press(SPACE), at(t, 1_000));
+        app.on_key(release(SPACE), at(t, 1_600));
+        assert!(matches!(app.state, State::Running { .. }));
+        // zero means no hold at all
+        let mut app = App::new(true);
+        app.inspection_on = false;
+        app.hold = Duration::ZERO;
+        app.on_key(press(SPACE), t);
+        app.on_key(release(SPACE), at(t, 1));
+        assert!(matches!(app.state, State::Running { .. }));
+    }
+
+    #[test]
+    fn settings_screen_changes_save_and_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("cubetimer-settings2-{}", std::process::id()));
+        let path = dir.join("sessions.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new(true).with_storage(path.clone(), store::load(&path));
+        assert_eq!(app.hold, HOLD_READY);
+        key(&mut app, KeyCode::Char(','));
+        assert_eq!(app.settings_row, Some(0));
+        key(&mut app, KeyCode::Right);
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.hold, Duration::from_millis(400));
+        key(&mut app, KeyCode::Down); // inspection
+        key(&mut app, KeyCode::Left);
+        assert!(!app.inspection_on);
+        key(&mut app, KeyCode::Down); // precision
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.precision, Precision::Milli);
+        key(&mut app, KeyCode::Down); // bell
+        key(&mut app, KeyCode::Right);
+        assert!(app.bell);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.settings_row, None);
+        let again = App::new(true).with_storage(path.clone(), store::load(&path));
+        assert_eq!(again.hold, Duration::from_millis(400));
+        assert!(!again.inspection_on && again.bell);
+        assert_eq!(again.precision, Precision::Milli);
+    }
+
+    #[test]
+    fn hold_time_stays_between_zero_and_a_second() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char(','));
+        for _ in 0..40 {
+            key(&mut app, KeyCode::Left);
+        }
+        assert_eq!(app.hold, Duration::ZERO);
+        for _ in 0..40 {
+            key(&mut app, KeyCode::Right);
+        }
+        assert_eq!(app.hold, Duration::from_millis(MAX_HOLD_MS));
+        // a hand-edited file can't set an absurd hold either
+        let mut loaded = store::Loaded {
+            data: Data::default(),
+            warning: None,
+        };
+        loaded.data.settings.hold_ms = 99_999;
+        let app = App::new(true).with_storage(PathBuf::from("/nonexistent/s.json"), loaded);
+        assert_eq!(app.hold, Duration::from_millis(MAX_HOLD_MS));
+    }
+
+    #[test]
+    fn precision_shows_in_the_timer_display() {
+        let mut app = with_solves(&[12_345]);
+        assert_eq!(app.view(Instant::now()).text, "12.34");
+        app.precision = Precision::Milli;
+        assert_eq!(app.view(Instant::now()).text, "12.345");
+    }
+
+    #[test]
+    fn settings_keys_do_not_leak_to_the_timer() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char(','));
+        for k in [
+            SPACE,
+            KeyCode::Char('d'),
+            KeyCode::Char('h'),
+            KeyCode::Char('q'),
+        ] {
+            key(&mut app, k);
+        }
+        assert_eq!(app.state, State::Idle);
+        assert_eq!(app.solves()[0].penalty, Penalty::Ok);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn typing_a_session_name_saves_it_and_empty_clears_it() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('r'));
+        assert!(app.input.is_some());
+        for c in "one-handed".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Backspace);
+        key(&mut app, KeyCode::Char('!'));
+        // while typing, keys are text: space and q don't start or quit
+        key(&mut app, SPACE);
+        key(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit && app.state == State::Idle);
+        key(&mut app, KeyCode::Enter);
+        assert!(app.input.is_none());
+        assert_eq!(app.data.sessions[0].name.as_deref(), Some("one-hande! q"));
+        // reopening shows the current name to edit; clearing it removes it
+        key(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.input.as_ref().unwrap().text, "one-hande! q");
+        for _ in 0..20 {
+            key(&mut app, KeyCode::Backspace);
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.data.sessions[0].name, None);
+        // escape cancels
+        key(&mut app, KeyCode::Char('r'));
+        key(&mut app, KeyCode::Char('x'));
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.data.sessions[0].name, None);
+    }
+
+    #[test]
+    fn names_are_limited_and_not_for_drill_sessions() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('r'));
+        for _ in 0..200 {
+            key(&mut app, KeyCode::Char('a'));
+        }
+        assert_eq!(app.input.as_ref().unwrap().text.chars().count(), 80);
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('t'));
+        key(&mut app, KeyCode::Char('r'));
+        assert!(app.input.is_none(), "a trainer session isn't renamed");
+    }
+
+    #[test]
+    fn comments_are_added_to_any_solve_from_the_history() {
+        let mut app = with_solves(&[1_000, 2_000, 3_000]);
+        key(&mut app, KeyCode::Char('h'));
+        key(&mut app, KeyCode::Down); // the middle solve
+        key(&mut app, KeyCode::Char('c'));
+        for c in "lockup".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.solves()[1].comment.as_deref(), Some("lockup"));
+        assert!(app.solves()[0].comment.is_none() && app.solves()[2].comment.is_none());
+        assert_eq!(app.history, Some(1), "still in the history");
+    }
+
+    #[test]
+    fn clipboard_sequences_are_correct_osc_52() {
+        // RFC 4648 test vectors
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(plain.as_bytes()), encoded);
+        }
+        assert_eq!(clipboard_sequence("R U"), "\x1b]52;c;UiBV\x07");
+        // non-ASCII text is sent as UTF-8
+        assert_eq!(base64("é".as_bytes()), "w6k=");
+    }
+
+    #[test]
+    fn y_copies_the_scramble_the_solve_and_the_averages() {
+        let mut app = with_solves(&[10_000, 11_000, 12_000, 13_000, 14_000]);
+        app.scramble = "R U F".into();
+        key(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.pending_copy.as_deref(), Some("R U F"));
+        assert!(app.status.as_deref().unwrap().starts_with("copied: R U F"));
+        app.pending_copy = None;
+        app.data.solves_mut()[1].scramble = "D2 B".into();
+        key(&mut app, KeyCode::Char('h'));
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down); // solve 2
+        key(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.pending_copy.as_deref(), Some("11.00  D2 B"));
+        key(&mut app, KeyCode::Esc);
+        app.pending_copy = None;
+        key(&mut app, KeyCode::Char('s'));
+        key(&mut app, KeyCode::Char('y'));
+        assert_eq!(
+            app.pending_copy.as_deref(),
+            Some("(10.00) 11.00 12.00 13.00 (14.00) = 12.00")
+        );
+        app.pending_copy = None;
+        key(&mut app, KeyCode::Char('Y'));
+        assert!(app.pending_copy.is_none(), "no ao12 yet");
+        assert!(app.status.as_deref().unwrap().contains("ao12"));
+    }
 }
 
 /// Helpers for tests in other modules.
@@ -2387,4 +2754,43 @@ pub mod tests_support {
             .unwrap();
         app.select_puzzle(p);
     }
+}
+
+/// `text` cut to `max` characters, with `…` if it was longer.
+fn ellipsis(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        text.chars().take(max.saturating_sub(1)).collect::<String>() + "\u{2026}"
+    }
+}
+
+/// Standard base64 (RFC 4648), for the clipboard escape sequence.
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
+            | *chunk.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The escape sequence that asks the terminal to set the clipboard (OSC 52).
+fn clipboard_sequence(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64(text.as_bytes()))
+}
+
+fn write_clipboard(text: &str) -> io::Result<()> {
+    let mut out = io::stdout();
+    out.write_all(clipboard_sequence(text).as_bytes())?;
+    out.flush()
 }
