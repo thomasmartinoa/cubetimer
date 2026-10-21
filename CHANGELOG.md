@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - 2x2, 4x4, 5x5, 6x6 and 7x7 next to the 3x3: `e` picks the puzzle, and every puzzle has
   its own sessions, stats and scrambles. Files saved by 0.1.0 open unchanged as 3x3.

@@ -1,6 +1,6 @@
 # Maintainer: thomasmartinoa <thomasmartinoa@gmail.com>
 pkgname=cubetimer
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Full-screen speedcube timer for the terminal: WCA inspection, hold-to-start, random-state scrambles'
 arch=('x86_64' 'aarch64')

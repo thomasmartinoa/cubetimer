@@ -7,7 +7,7 @@ GitHub release, so tag first.
 
 1. Push the repo and tag the version that matches `Cargo.toml`:
    ```sh
-   git tag -a v0.1.0 -m "cubetimer 0.1.0"
+   git tag -a v0.2.0 -m "cubetimer 0.2.0"
    git push origin main --tags
    ```
 2. Create an account at <https://aur.archlinux.org> and add your SSH public key to it.
@@ -19,7 +19,7 @@ GitHub release, so tag first.
    makepkg -f                              # build + run the tests; try: pacman -U cubetimer-*.pkg.tar.zst
    makepkg --printsrcinfo > .SRCINFO
    git add PKGBUILD .SRCINFO
-   git commit -m "Initial import: cubetimer 0.1.0"
+   git commit -m "Initial import: cubetimer 0.2.0"
    git push origin master                  # the AUR uses `master`
    ```
    For a clean-chroot build (what the AUR guidelines recommend), install `devtools` and run
