@@ -7,6 +7,7 @@ mod chart;
 mod cube;
 mod fmt;
 mod font;
+mod import;
 mod nxn;
 mod puzzle;
 mod render3d;
@@ -36,6 +37,9 @@ Usage: cubetimer [OPTIONS]
 
 Options:
       --export   Print every solve as CSV (for spreadsheets) and exit
+      --import FILE [--dry-run]
+                 Add the sessions of a csTimer export to your solves
+                 (--dry-run only says what would be imported)
   -h, --help     Print this help
   -V, --version  Print the version
 
@@ -48,16 +52,81 @@ enum Action {
     Help,
     Version,
     Export,
+    Import { path: String, dry_run: bool },
     Unknown(String),
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Action {
-    match args.into_iter().next().as_deref() {
+    let args: Vec<String> = args.into_iter().collect();
+    match args.first().map(String::as_str) {
         None => Action::Run,
         Some("-h" | "--help") => Action::Help,
         Some("-V" | "--version") => Action::Version,
         Some("--export") => Action::Export,
+        Some("--import") => {
+            let dry_run = args.iter().any(|a| a == "--dry-run");
+            match args[1..].iter().find(|a| !a.starts_with("--")) {
+                Some(path) => Action::Import {
+                    path: path.clone(),
+                    dry_run,
+                },
+                None => Action::Unknown("--import (needs a file)".into()),
+            }
+        }
         Some(other) => Action::Unknown(other.to_string()),
+    }
+}
+
+/// `--import`: read a csTimer export and add its sessions to the saved data.
+fn import(path: &str, dry_run: bool) -> ExitCode {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("cubetimer: can't read {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (sessions, summary) = match import::parse(&text) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("cubetimer: {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("{}", summary.describe(dry_run));
+    if dry_run || sessions.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+    let Some(data_path) = store::default_path() else {
+        eprintln!("cubetimer: no data directory");
+        return ExitCode::FAILURE;
+    };
+    // writing your data: not while the timer is running
+    let _lock = match store::lock(&data_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            eprintln!("cubetimer: the timer is running; close it first, then import");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("cubetimer: can't lock {}: {e}", data_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut data = match store::read(&data_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("cubetimer: can't read {}: {e}", data_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    import::merge(&mut data, sessions);
+    match store::save(&data_path, &data) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("cubetimer: can't save {}: {e}", data_path.display());
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -89,6 +158,7 @@ fn main() -> ExitCode {
                 }
             };
         }
+        Action::Import { path, dry_run } => return import(&path, dry_run),
         Action::Unknown(arg) => {
             eprintln!("cubetimer: unknown option '{arg}'\nTry 'cubetimer --help'.");
             return ExitCode::from(2);
@@ -153,6 +223,25 @@ mod tests {
         assert_eq!(args(&["-V"]), Action::Version);
         assert_eq!(args(&["--version"]), Action::Version);
         assert_eq!(args(&["--export"]), Action::Export);
+        assert_eq!(
+            args(&["--import", "a.json"]),
+            Action::Import {
+                path: "a.json".into(),
+                dry_run: false
+            }
+        );
+        assert_eq!(
+            args(&["--import", "--dry-run", "a.json"]),
+            Action::Import {
+                path: "a.json".into(),
+                dry_run: true
+            }
+        );
+        assert!(matches!(args(&["--import"]), Action::Unknown(_)));
+        assert!(matches!(
+            args(&["--import", "--dry-run"]),
+            Action::Unknown(_)
+        ));
         assert_eq!(args(&["--bogus"]), Action::Unknown("--bogus".into()));
     }
 }

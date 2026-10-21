@@ -90,6 +90,79 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(selected) = app.picker {
         draw_picker(frame, area, app, selected);
     }
+    if let Some(row) = app.settings_row {
+        draw_settings(frame, area, app, row);
+    }
+    if let Some(input) = &app.input {
+        draw_input(frame, area, input);
+    }
+}
+
+/// The settings screen: one row per setting, left and right change it.
+fn draw_settings(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
+    let on = |b: bool| if b { "on" } else { "off" };
+    let rows: [(&str, String); App::SETTINGS_ROWS] = [
+        ("hold time", format!("{} ms", app.hold.as_millis())),
+        ("inspection", on(app.inspection_on).into()),
+        (
+            "precision",
+            match app.precision {
+                fmt::Precision::Centi => "0.01".into(),
+                fmt::Precision::Milli => "0.001".into(),
+            },
+        ),
+        ("inspection bell", on(app.bell).into()),
+        ("digit font", font::name_at(app.font).into()),
+        ("3D look", app.look.name().into()),
+    ];
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (name, value))| {
+            let style = if i == selected {
+                Style::new().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new()
+            };
+            Line::from(Span::styled(format!(" {name:<16}  < {value:^8} > "), style))
+        })
+        .collect();
+    let width = 40.min(area.width);
+    let height = (lines.len() as u16 + 4).min(area.height);
+    let [popup] = Layout::horizontal([Constraint::Length(width)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [popup] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" settings ")
+                .title_bottom(Line::from(" up/down pick, left/right change ").right_aligned())
+                .padding(Padding::new(0, 0, 1, 0)),
+        ),
+        popup,
+    );
+}
+
+/// The line being typed (a session name or a comment), along the bottom.
+fn draw_input(frame: &mut Frame, area: Rect, input: &crate::app::TextInput) {
+    let label = match input.kind {
+        crate::app::InputKind::SessionName => "session name",
+        crate::app::InputKind::Comment(_) => "comment",
+    };
+    let [_, line] = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(area);
+    frame.render_widget(Clear, line);
+    frame.render_widget(
+        Paragraph::new(format!("{}\u{2588}", input.text)).block(
+            Block::bordered().title(format!(" {label} ")).title_bottom(
+                Line::from(" enter saves, esc cancels, empty clears ").right_aligned(),
+            ),
+        ),
+        line,
+    );
 }
 
 /// The big time, or the history browser when it is open.
@@ -261,8 +334,12 @@ fn draw_stats_grid(frame: &mut Frame, area: Rect, app: &App) {
         Some(d) => format!(" {} trainer - {} cases ", d.set.name(), d.cases.len()),
         None => {
             let (number, count) = session_position(app);
+            let name = match &app.data.sessions[app.data.current].name {
+                Some(n) => format!(" \"{n}\""),
+                None => String::new(),
+            };
             format!(
-                " stats - {} - session {number}/{count} ",
+                " stats - {} - session {number}/{count}{name} ",
                 app.puzzle().name()
             )
         }
@@ -512,13 +589,14 @@ fn draw_stats_line(frame: &mut Frame, area: Rect, app: &App) {
 fn footer_text(app: &App, width: usize) -> String {
     let on = |b: bool| if b { "on" } else { "off" };
     // (priority: lower stays longer, text), in display order
-    let parts: [(u8, String); 14] = [
+    let parts: [(u8, String); 15] = [
         (1, "space go".into()),
         (6, "+/d/o mark".into()),
         (8, "bksp delete".into()),
         (7, "h history".into()),
         (7, "s stats".into()),
         (7, "a algs".into()),
+        (9, ", settings".into()),
         (9, "n [ ] session".into()),
         (5, format!("i inspect:{}", on(app.inspection_on))),
         (4, format!("f font:{}", font::name_at(app.font))),
@@ -534,7 +612,7 @@ fn footer_text(app: &App, width: usize) -> String {
     ];
     let mut order: Vec<usize> = (0..parts.len()).collect();
     order.sort_by_key(|&i| parts[i].0);
-    let mut keep = [false; 14];
+    let mut keep = [false; 15];
     let mut used = 1;
     for i in order {
         let need = parts[i].1.chars().count() + 2;
@@ -570,7 +648,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Every key, for the `?` overlay.
-const HELP: [(&str, &str); 23] = [
+const HELP: [(&str, &str); 27] = [
     ("space", "inspect, hold and release to start, stop"),
     ("any key", "stop a running solve"),
     ("esc", "cancel inspection or a hold"),
@@ -579,6 +657,13 @@ const HELP: [(&str, &str); 23] = [
     ("h", "history: browse, mark and delete any solve"),
     ("s", "statistics: chart, distribution, summary"),
     ("a", "algorithms: PLL, OLL, F2L, with the 3D cube"),
+    (",", "settings: hold time, precision, bell, font, 3D look"),
+    ("r", "name the current session"),
+    (
+        "y",
+        "copy the scramble (in history: the solve; in stats: ao5, Y ao12)",
+    ),
+    ("c", "in history: comment the selected solve"),
     ("e", "choose the puzzle: 2x2 to 7x7"),
     ("v", "the scrambled cube in 3D: turn it, watch the scramble"),
     ("n", "new session"),
@@ -592,7 +677,7 @@ const HELP: [(&str, &str); 23] = [
     ("q / ctrl-c", "quit"),
     ("", ""),
     ("in stats", "r or 1-4 change the range, esc closes"),
-    ("in history", "up/down j/k pgup/pgdn home/end move"),
+    ("in history", "up/down j/k pgup/pgdn home/end move, v cube"),
     ("", "+ / d / o mark, bksp delete, esc close"),
 ];
 
@@ -710,6 +795,13 @@ fn draw_history(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
         Line::from(Span::styled("scramble", dim())),
         Line::from(solve.scramble.clone()),
     ];
+    if let Some(note) = &solve.comment {
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            Span::styled("comment   ", dim()),
+            Span::styled(note.clone(), Style::new().fg(Color::Cyan)),
+        ]));
+    }
     if let Some(i) = app.confirm_delete {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
@@ -717,7 +809,7 @@ fn draw_history(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     }
-    let keys = "up/down move   + d o mark   bksp delete   esc close";
+    let keys = "up/down move   + d o mark   c comment   y copy   bksp delete   v cube   esc close";
     let [content, help] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
     // The trend chart gets the right-hand side when there is room for it.
