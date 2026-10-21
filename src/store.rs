@@ -3,6 +3,7 @@
 //! Sessions live in `<data dir>/cubetimer/sessions.json` and are written
 //! atomically (temp file, then rename).
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::fmt;
+use crate::puzzle::{self, Puzzle};
 use crate::stats::{Penalty, TimeResult};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +23,13 @@ pub struct Solve {
     pub scramble: String,
     /// Unix timestamp in seconds.
     pub ts: u64,
+    /// The algorithm case a training solve was (`PLL:T`); none for normal
+    /// solves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case: Option<String>,
+    /// A note on the solve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 impl Solve {
@@ -33,6 +42,8 @@ impl Solve {
             penalty,
             scramble,
             ts,
+            case: None,
+            comment: None,
         }
     }
 
@@ -41,9 +52,45 @@ impl Solve {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub solves: Vec<Solve>,
+    /// WCA event id (`333`, `222`, ...). Files from before puzzles existed
+    /// have none, and those sessions are 3x3.
+    #[serde(default = "default_puzzle_id")]
+    pub puzzle: String,
+    /// For a trainer's session, the algorithm set it drills (`PLL`). Drill
+    /// sessions are kept apart from normal ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drill: Option<String>,
+    /// A name for the session ("one-handed", "warm-up").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+fn default_puzzle_id() -> String {
+    puzzle::DEFAULT_ID.into()
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Session::new(Puzzle::Cube3)
+    }
+}
+
+impl Session {
+    pub fn new(puzzle: Puzzle) -> Session {
+        Session {
+            solves: Vec::new(),
+            puzzle: puzzle.id().into(),
+            drill: None,
+            name: None,
+        }
+    }
+
+    pub fn puzzle(&self) -> Puzzle {
+        Puzzle::from_id_or_default(&self.puzzle)
+    }
 }
 
 /// Preferences that survive a restart.
@@ -54,6 +101,12 @@ pub struct Settings {
     pub font: String,
     pub inspection: bool,
     pub bell: bool,
+    /// How the 3D cube is drawn, see `view3d::Look`.
+    pub look: String,
+    /// How long space is held before the timer is ready, in milliseconds.
+    pub hold_ms: u64,
+    /// Show times to the thousandth.
+    pub milli: bool,
 }
 
 impl Default for Settings {
@@ -62,6 +115,9 @@ impl Default for Settings {
             font: crate::font::DEFAULT.into(),
             inspection: true,
             bell: false,
+            look: crate::view3d::Look::default().name().into(),
+            hold_ms: 300,
+            milli: false,
         }
     }
 }
@@ -75,6 +131,10 @@ pub struct Data {
     pub current: usize,
     #[serde(default)]
     pub settings: Settings,
+    /// How far you are with each algorithm, by case key ("PLL:T" ->
+    /// "learning"). Cases you haven't marked aren't listed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub progress: BTreeMap<String, String>,
 }
 
 impl Default for Data {
@@ -83,6 +143,7 @@ impl Default for Data {
             sessions: vec![Session::default()],
             current: 0,
             settings: Settings::default(),
+            progress: BTreeMap::new(),
         }
     }
 }
@@ -99,6 +160,33 @@ impl Data {
 
     pub fn solves(&self) -> &[Solve] {
         &self.sessions[self.current].solves
+    }
+
+    /// The puzzle of the session being timed.
+    pub fn puzzle(&self) -> Puzzle {
+        self.sessions[self.current].puzzle()
+    }
+
+    /// Indices of every session of `puzzle`, in order.
+    pub fn sessions_of(&self, puzzle: Puzzle) -> Vec<usize> {
+        (0..self.sessions.len())
+            .filter(|&i| self.sessions[i].puzzle() == puzzle && self.sessions[i].drill.is_none())
+            .collect()
+    }
+
+    /// The drill session for algorithm set `set` (`PLL`), made if needed.
+    pub fn drill_session(&mut self, set: &str) -> usize {
+        if let Some(i) = self
+            .sessions
+            .iter()
+            .position(|s| s.drill.as_deref() == Some(set))
+        {
+            return i;
+        }
+        let mut s = Session::new(Puzzle::Cube3);
+        s.drill = Some(set.into());
+        self.sessions.push(s);
+        self.sessions.len() - 1
     }
 
     pub fn solves_mut(&mut self) -> &mut Vec<Solve> {
@@ -124,7 +212,7 @@ pub fn to_csv(data: &Data) -> String {
         }
     };
     let secs = |ms: u64| format!("{}.{:03}", ms / 1000, ms % 1000);
-    let mut out = String::from("session,solve,time,penalty,result,scramble,date\n");
+    let mut out = String::from("session,puzzle,solve,time,penalty,result,scramble,date\n");
     for (si, session) in data.sessions.iter().enumerate() {
         for (i, s) in session.solves.iter().enumerate() {
             let penalty = match s.penalty {
@@ -137,8 +225,9 @@ pub fn to_csv(data: &Data) -> String {
                 TimeResult::Dnf => "DNF".into(),
             };
             out += &format!(
-                "{},{},{},{penalty},{result},{},{}\n",
+                "{},{},{},{},{penalty},{result},{},{}\n",
                 si + 1,
+                session.puzzle().name(),
                 i + 1,
                 secs(s.ms),
                 field(&s.scramble),
@@ -251,12 +340,16 @@ mod tests {
             penalty: Penalty::Plus2,
             scramble: "R U".into(),
             ts: 7,
+            case: None,
+            comment: None,
         });
         data.solves_mut().push(Solve {
             ms: 9_990,
             penalty: Penalty::Dnf,
             scramble: "F2".into(),
             ts: 8,
+            case: None,
+            comment: None,
         });
         data.sessions.push(Session::default());
         data.current = 1;
@@ -301,12 +394,19 @@ mod tests {
             (s.font.as_str(), s.inspection, s.bell),
             ("pixel", true, false)
         );
+        assert_eq!(
+            s.look, "image",
+            "a file from before looks existed gets the default"
+        );
 
         let mut data = sample();
         data.settings = Settings {
             font: "plain".into(),
             inspection: false,
             bell: true,
+            look: "ascii".into(),
+            hold_ms: 150,
+            milli: true,
         };
         save(&path, &data).unwrap();
         assert_eq!(load(&path).data.settings, data.settings);
@@ -327,9 +427,15 @@ mod tests {
     fn csv_export() {
         let csv = to_csv(&sample());
         let lines: Vec<&str> = csv.lines().collect();
-        assert_eq!(lines[0], "session,solve,time,penalty,result,scramble,date");
-        assert_eq!(lines[1], "1,1,12.340,+2,14.340,R U,1970-01-01T00:00:07Z");
-        assert_eq!(lines[2], "1,2,9.990,dnf,DNF,F2,1970-01-01T00:00:08Z");
+        assert_eq!(
+            lines[0],
+            "session,puzzle,solve,time,penalty,result,scramble,date"
+        );
+        assert_eq!(
+            lines[1],
+            "1,3x3,1,12.340,+2,14.340,R U,1970-01-01T00:00:07Z"
+        );
+        assert_eq!(lines[2], "1,3x3,2,9.990,dnf,DNF,F2,1970-01-01T00:00:08Z");
         assert_eq!(lines.len(), 3); // the second session is empty
     }
 
@@ -341,6 +447,8 @@ mod tests {
             penalty: Penalty::Ok,
             scramble: "a,\"b\"".into(),
             ts: 0,
+            case: None,
+            comment: None,
         });
         assert!(to_csv(&data).contains(",0.005,\"a,\"\"b\"\"\","));
     }
@@ -399,5 +507,84 @@ mod tests {
         save(&path, &Data::default()).unwrap();
         save(&path, &sample()).unwrap();
         assert_eq!(load(&path).data, sample());
+    }
+
+    #[test]
+    fn old_files_without_puzzles_load_as_3x3() {
+        let dir = temp_dir("old-format");
+        let path = dir.join("sessions.json");
+        fs::write(
+            &path,
+            r#"{"sessions":[{"solves":[{"ms":9000,"penalty":"ok","scramble":"R","ts":1}]},{"solves":[]}],"current":1}"#,
+        )
+        .unwrap();
+        let data = read(&path).unwrap();
+        assert!(data.sessions.iter().all(|s| s.puzzle() == Puzzle::Cube3));
+        assert_eq!(data.sessions[0].puzzle, "333");
+        assert_eq!(data.sessions[0].solves[0].ms, 9_000);
+    }
+
+    #[test]
+    fn puzzles_are_saved_and_unknown_ones_read_as_3x3() {
+        let dir = temp_dir("puzzles");
+        let path = dir.join("sessions.json");
+        let mut data = Data::default();
+        data.sessions.push(Session::new(Puzzle::Cube5));
+        data.sessions.push(Session {
+            solves: vec![],
+            puzzle: "from-the-future".into(),
+            drill: None,
+            name: None,
+        });
+        save(&path, &data).unwrap();
+        let back = read(&path).unwrap();
+        assert_eq!(back.sessions[1].puzzle(), Puzzle::Cube5);
+        assert_eq!(back.sessions[2].puzzle(), Puzzle::Cube3);
+        assert_eq!(back.sessions[2].puzzle, "from-the-future"); // kept as written
+        assert_eq!(back.sessions_of(Puzzle::Cube3), vec![0, 2]);
+        assert_eq!(back.sessions_of(Puzzle::Cube5), vec![1]);
+        assert!(back.sessions_of(Puzzle::Cube2).is_empty());
+    }
+
+    #[test]
+    fn csv_names_the_puzzle() {
+        let mut data = Data::default();
+        data.sessions.push(Session::new(Puzzle::Cube4));
+        data.current = 1;
+        data.solves_mut().push(Solve {
+            ms: 50_000,
+            penalty: Penalty::Ok,
+            scramble: "Rw".into(),
+            ts: 0,
+            case: None,
+            comment: None,
+        });
+        assert!(to_csv(&data).contains("\n2,4x4,1,50.000,ok,50.000,Rw,"));
+    }
+
+    #[test]
+    fn drill_sessions_are_separate_and_reused() {
+        let mut data = Data::default();
+        let pll = data.drill_session("PLL");
+        assert_eq!(pll, 1);
+        assert_eq!(data.drill_session("PLL"), 1, "the same one again");
+        assert_eq!(data.drill_session("OLL"), 2);
+        // normal session lists never include drills
+        assert_eq!(data.sessions_of(Puzzle::Cube3), vec![0]);
+        // and they survive saving, as does a solve's case
+        let dir = temp_dir("drill");
+        let path = dir.join("sessions.json");
+        data.current = pll;
+        let mut s = Solve::new(2_000, Penalty::Ok, "R U".into());
+        s.case = Some("PLL:T".into());
+        data.solves_mut().push(s);
+        save(&path, &data).unwrap();
+        let back = read(&path).unwrap();
+        assert_eq!(back.sessions[1].drill.as_deref(), Some("PLL"));
+        assert_eq!(back.sessions[1].solves[0].case.as_deref(), Some("PLL:T"));
+        // normal solves and sessions don't write the new fields at all
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("\"drill\"").count(), 2);
+        assert_eq!(text.matches("\"case\"").count(), 1);
     }
 }

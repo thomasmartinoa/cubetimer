@@ -10,14 +10,22 @@ use std::time::{Duration, Instant};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::algs::{Case, Set};
+use crate::algview::{self, AlgBrowser};
+use crate::chart::Range;
 use crate::fmt::{self, Precision, RunDisplay};
 use crate::font;
+use crate::puzzle::{self, Puzzle};
 use crate::scramble::Scrambler;
 use crate::stats::{self, Penalty, Summary, TimeResult};
+use crate::statsview::StatsView;
 use crate::store::{self, Data, Loaded, Session, Settings, Solve};
+use crate::trainer::Drill;
 use crate::ui;
+use crate::view3d::{CubeView, Gfx, Look};
 
 /// How long space must be held before the timer is ready.
+/// The default hold time; the setting overrides it.
 pub const HOLD_READY: Duration = Duration::from_millis(300);
 
 /// How long a new personal best flashes, and how fast it blinks.
@@ -84,6 +92,30 @@ fn typed(key: KeyEvent) -> KeyCode {
     }
 }
 
+/// Whether `code` is the key that cycles the cube look.
+fn key_code_is_look(code: KeyCode) -> bool {
+    code == KeyCode::Char('m')
+}
+
+/// What a line of typed text is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputKind {
+    SessionName,
+    /// The solve (an index into the session) being commented.
+    Comment(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextInput {
+    pub kind: InputKind,
+    pub text: String,
+}
+
+/// The longest hold time the settings allow.
+pub const MAX_HOLD_MS: u64 = 1000;
+/// The longest name or comment.
+const MAX_TEXT: usize = 80;
+
 pub struct App {
     pub state: State,
     pub data: Data,
@@ -99,6 +131,26 @@ pub struct App {
     pub history: Option<usize>,
     /// The key help overlay is open.
     pub show_help: bool,
+    /// The algorithm browser, when open.
+    pub algs: Option<AlgBrowser>,
+    /// The trainer, while drilling algorithms; scrambles come from it.
+    pub drill: Option<Drill>,
+    /// The case the current training scramble sets up.
+    drill_case: Option<&'static Case>,
+    /// The case of the last training solve, shown after it.
+    pub last_case: Option<&'static Case>,
+    /// The session to go back to when training stops.
+    drill_return: usize,
+    /// The statistics screen, when open.
+    pub stats: Option<StatsView>,
+    /// The puzzle picker is open with this puzzle highlighted.
+    pub picker: Option<usize>,
+    /// The cube view (`v`), when open.
+    pub cube_view: Option<CubeView>,
+    /// How the terminal shows images, for the cube view.
+    pub gfx: Gfx,
+    /// How the cube view draws the cube (`m` cycles it).
+    pub look: Look,
     /// The key last pressed and not yet released (with release events only),
     /// to tell auto-repeat from a new press.
     down: Option<KeyCode>,
@@ -109,6 +161,14 @@ pub struct App {
     pub enhanced: bool,
     pub run_display: RunDisplay,
     pub precision: Precision,
+    /// How long space is held before the timer is ready.
+    pub hold: Duration,
+    /// The settings screen, with the selected row.
+    pub settings_row: Option<usize>,
+    /// A line of text being typed (a session name or a solve comment).
+    pub input: Option<TextInput>,
+    /// Text to put on the clipboard with the next frame (OSC 52).
+    pub pending_copy: Option<String>,
     pub bell: bool,
     /// The digit font choice (0 is `auto`), see `font::name_at`.
     pub font: usize,
@@ -131,16 +191,30 @@ impl App {
             history: None,
             confirm_session_delete: false,
             show_help: false,
+            picker: None,
+            stats: None,
+            algs: None,
+            drill: None,
+            drill_case: None,
+            last_case: None,
+            drill_return: 0,
+            cube_view: None,
+            gfx: Gfx::default(),
+            look: Look::default(),
             down: None,
             pb_flash: None,
             inspection_on: true,
             enhanced,
             run_display: RunDisplay::default(),
             precision: Precision::default(),
+            hold: HOLD_READY,
+            settings_row: None,
+            input: None,
+            pending_copy: None,
             bell: false,
             font: font::index_of(font::DEFAULT),
             scramble: String::new(),
-            scrambler: Scrambler::new(),
+            scrambler: Scrambler::new(Puzzle::Cube3),
             quit: false,
             warned: 0,
         };
@@ -159,7 +233,38 @@ impl App {
         self.font = font::index_of(&settings.font);
         self.inspection_on = settings.inspection;
         self.bell = settings.bell;
+        self.look = Look::from_name(&settings.look);
+        self.hold = Duration::from_millis(settings.hold_ms.min(MAX_HOLD_MS));
+        self.precision = if settings.milli {
+            Precision::Milli
+        } else {
+            Precision::Centi
+        };
+        // a run that ended while training restarts in a normal session
+        if self.data.sessions[self.data.current].drill.is_some() {
+            let puzzle = self.puzzle();
+            self.data.current = match self.data.sessions_of(puzzle).last() {
+                Some(&i) => i,
+                None => {
+                    self.data.sessions.push(Session::new(puzzle));
+                    self.data.sessions.len() - 1
+                }
+            };
+        }
+        self.reset_scrambler();
         self
+    }
+
+    /// The puzzle being timed.
+    pub fn puzzle(&self) -> Puzzle {
+        self.data.puzzle()
+    }
+
+    /// Start making scrambles for the current puzzle (after switching puzzle
+    /// or loading a file whose current session isn't a 3x3).
+    fn reset_scrambler(&mut self) {
+        self.scrambler = Scrambler::new(self.puzzle());
+        self.scramble = self.scrambler.try_next().unwrap_or_default();
     }
 
     pub fn solves(&self) -> &[Solve] {
@@ -171,6 +276,9 @@ impl App {
             font: font::name_at(self.font).into(),
             inspection: self.inspection_on,
             bell: self.bell,
+            look: self.look.name().into(),
+            hold_ms: self.hold.as_millis() as u64,
+            milli: self.precision == Precision::Milli,
         };
         if let Some(path) = &self.path
             && let Err(e) = store::save(path, &self.data)
@@ -180,8 +288,21 @@ impl App {
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        let mut mouse = false;
         while !self.quit {
+            if self.cube_view.is_some() || self.algs.is_some() {
+                // ask the terminal about images once, before drawing the first image
+                self.gfx.ensure_picker();
+            }
+            // the mouse turns the cube; elsewhere the terminal keeps it for selecting text
+            if self.cube_view.is_some() != mouse {
+                mouse = !mouse;
+                crate::term::set_mouse(mouse)?;
+            }
             terminal.draw(|f| ui::draw(f, self))?;
+            if let Some(text) = self.pending_copy.take() {
+                write_clipboard(&text)?;
+            }
             if let Some(t) = self.tick_interval()
                 && !event::poll(t)?
             {
@@ -203,6 +324,9 @@ impl App {
 
     /// How long the loop may wait for input; `None` blocks until a key.
     fn tick_interval(&self) -> Option<Duration> {
+        if self.cube_view.as_ref().is_some_and(CubeView::animating) {
+            return Some(Duration::from_millis(30));
+        }
         match self.state {
             State::Idle if self.pb_flash.is_some() || self.scramble.is_empty() => {
                 Some(Duration::from_millis(50))
@@ -218,6 +342,11 @@ impl App {
             Event::Key(key) => self.on_key(key, now),
             // A key let go while another window had focus sends no release.
             Event::FocusLost => self.down = None,
+            Event::Mouse(m) => {
+                if let Some(view) = self.cube_view.as_mut() {
+                    view.mouse(m.kind, m.column, m.row);
+                }
+            }
             _ => {}
         }
     }
@@ -249,7 +378,20 @@ impl App {
             }
         };
         if repeat {
-            // Auto-repeat only scrolls the history list.
+            // Auto-repeat turns the cube in the cube view...
+            if let Some(view) = self.cube_view.as_mut() {
+                if CubeView::repeats(code) {
+                    view.key(code, now);
+                }
+                return;
+            }
+            if let Some(browser) = self.algs.as_mut() {
+                if AlgBrowser::repeats(code) {
+                    browser.key(code);
+                }
+                return;
+            }
+            // ...and otherwise only scrolls the history list.
             let scrolls = matches!(
                 code,
                 KeyCode::Up
@@ -287,6 +429,93 @@ impl App {
         if std::mem::take(&mut self.show_help) {
             return;
         }
+        if let Some(view) = self.cube_view.as_mut() {
+            view.has_images = self.gfx.has_images();
+            if !view.key(code, now) {
+                self.cube_view = None;
+            } else if view.look != self.look && key_code_is_look(code) {
+                // `m` changed the look: remember it for the next view and run
+                self.look = view.look;
+                self.persist();
+            }
+            return;
+        }
+        if let Some(input) = self.input.as_mut() {
+            match code {
+                KeyCode::Enter => self.commit_input(),
+                KeyCode::Esc => self.input = None,
+                KeyCode::Backspace => {
+                    input.text.pop();
+                }
+                KeyCode::Char(c) if input.text.chars().count() < MAX_TEXT => input.text.push(c),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(row) = self.settings_row {
+            self.settings_key(code, row);
+            return;
+        }
+        if let Some(browser) = self.algs.as_mut() {
+            match browser.key(code) {
+                algview::Action::None => {}
+                algview::Action::Close => self.algs = None,
+                algview::Action::Train(set) => {
+                    self.algs = None;
+                    self.start_drill(set);
+                }
+                algview::Action::Show(case) => {
+                    let steps = crate::alg::steps(case.alg).unwrap_or_default();
+                    let title = format!("{}   {}", case.title(), case.alg);
+                    self.gfx.ensure_picker();
+                    let mut view = CubeView::for_steps(title, algview::start_cube(case), steps);
+                    view.has_images = self.gfx.has_images();
+                    view.look = match self.look {
+                        Look::Image if !view.has_images => Look::Blocks,
+                        look => look,
+                    };
+                    self.cube_view = Some(view);
+                }
+                algview::Action::Mark(case) => {
+                    let key = case.key();
+                    let now = self
+                        .data
+                        .progress
+                        .get(&key)
+                        .map_or(algview::Progress::New, |s| algview::Progress::from_name(s));
+                    match now.next() {
+                        algview::Progress::New => self.data.progress.remove(&key),
+                        next => self.data.progress.insert(key, next.name().into()),
+                    };
+                    self.persist();
+                }
+            }
+            return;
+        }
+        if let Some(selected) = self.picker {
+            self.picker_key(code, selected);
+            return;
+        }
+        if let Some(view) = self.stats.as_mut() {
+            match code {
+                KeyCode::Char('r') => view.range = view.range.next(),
+                KeyCode::Char(c @ '1'..='4') => {
+                    view.range = Range::ALL[c.to_digit(10).unwrap_or(1) as usize - 1];
+                }
+                // y copies the last ao5 written out, Y the last ao12
+                KeyCode::Char(c @ ('y' | 'Y')) => {
+                    let n = if c == 'y' { 5 } else { 12 };
+                    let text = stats::ao_details(&self.results(), n, self.precision);
+                    match text {
+                        Some(t) => self.copy(t),
+                        None => self.status = Some(format!("not enough solves for an ao{n}")),
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('s' | 'q') => self.stats = None,
+                _ => {}
+            }
+            return;
+        }
         if let Some(selected) = self.history {
             self.history_key(code, selected);
             return;
@@ -308,10 +537,38 @@ impl App {
             KeyCode::Char('h') if idle => self.history = last,
             // `/` too: WezTerm sends Shift+/ without the SHIFT flag
             KeyCode::Char('?' | '/') | KeyCode::F(1) if idle => self.show_help = true,
+            // while training: t stops, and sessions and puzzles stay put
+            KeyCode::Char('t') if idle && self.drill.is_some() => self.stop_drill(),
+            KeyCode::Char('e' | 'n' | 'X' | '[' | ']') if self.drill.is_some() => {}
+            KeyCode::Char('e') if idle => {
+                self.picker = Some(
+                    puzzle::ALL
+                        .iter()
+                        .position(|&p| p == self.puzzle())
+                        .unwrap_or(1),
+                );
+            }
+            KeyCode::Char('v') if idle => self.open_cube_view(None),
+            KeyCode::Char('s') if idle => self.stats = Some(StatsView::new(self)),
+            KeyCode::Char('a') if idle => self.algs = Some(AlgBrowser::default()),
             KeyCode::Char('n') if idle => self.new_session(),
             KeyCode::Char('X') if idle => self.confirm_session_delete = true,
             KeyCode::Char('[') if idle => self.switch_session(-1),
             KeyCode::Char(']') if idle => self.switch_session(1),
+            KeyCode::Char(',') if idle => self.settings_row = Some(0),
+            KeyCode::Char('r') if idle && self.drill.is_none() => {
+                let name = self.data.sessions[self.data.current]
+                    .name
+                    .clone()
+                    .unwrap_or_default();
+                self.input = Some(TextInput {
+                    kind: InputKind::SessionName,
+                    text: name,
+                });
+            }
+            KeyCode::Char('y') if idle && !self.scramble.is_empty() => {
+                self.copy(self.scramble.clone());
+            }
             KeyCode::Char('p') => self.run_display = self.run_display.next(),
             KeyCode::Char('b') => {
                 self.bell = !self.bell;
@@ -348,7 +605,7 @@ impl App {
 
     fn space_release(&mut self, now: Instant) {
         if let State::Holding { since, inspection } = self.state {
-            self.state = if now.duration_since(since) >= HOLD_READY {
+            self.state = if now.duration_since(since) >= self.hold {
                 Self::running(now, inspection)
             } else {
                 match inspection {
@@ -382,7 +639,9 @@ impl App {
     fn stop(&mut self, now: Instant) {
         if let State::Running { start, penalty } = self.state {
             let ms = now.duration_since(start).as_millis() as u64;
-            let solve = Solve::new(ms, penalty, self.scramble.clone());
+            let mut solve = Solve::new(ms, penalty, self.scramble.clone());
+            solve.case = self.drill_case.map(Case::key);
+            self.last_case = self.drill_case.take();
             // Only a beaten best counts, so the first solve doesn't flash.
             let new_pb = matches!(
                 (stats::best(&self.results()), solve.result()),
@@ -390,10 +649,72 @@ impl App {
             );
             self.pb_flash = new_pb.then_some(now);
             self.data.solves_mut().push(solve);
-            self.scramble = self.scrambler.try_next().unwrap_or_default();
+            self.scramble.clear();
+            self.next_scramble();
             self.state = State::Idle;
             self.persist();
         }
+    }
+
+    /// Put `text` on the clipboard (through the terminal, OSC 52) and say so.
+    pub fn copy(&mut self, text: String) {
+        self.status = Some(format!("copied: {}", ellipsis(&text, 40)));
+        self.pending_copy = Some(text);
+    }
+
+    /// Finish typing: save the name or comment (empty clears it).
+    fn commit_input(&mut self) {
+        let Some(input) = self.input.take() else {
+            return;
+        };
+        let text = input.text.trim().to_string();
+        let value = (!text.is_empty()).then_some(text);
+        match input.kind {
+            InputKind::SessionName => self.data.sessions[self.data.current].name = value,
+            InputKind::Comment(i) => {
+                if let Some(solve) = self.data.solves_mut().get_mut(i) {
+                    solve.comment = value;
+                }
+            }
+        }
+        self.persist();
+    }
+
+    /// Rows of the settings screen.
+    pub const SETTINGS_ROWS: usize = 6;
+
+    /// Keys on the settings screen: up/down pick a row, left/right change it.
+    fn settings_key(&mut self, code: KeyCode, row: usize) {
+        let last = Self::SETTINGS_ROWS - 1;
+        match code {
+            KeyCode::Esc | KeyCode::Char(',' | 'q') => self.settings_row = None,
+            KeyCode::Up | KeyCode::Char('k') => self.settings_row = Some(row.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => self.settings_row = Some((row + 1).min(last)),
+            KeyCode::Left | KeyCode::Char('h') => self.adjust(row, -1),
+            KeyCode::Right | KeyCode::Char('l' | ' ') | KeyCode::Enter => self.adjust(row, 1),
+            _ => {}
+        }
+    }
+
+    /// Change setting `row` one step (-1 or 1).
+    fn adjust(&mut self, row: usize, step: i64) {
+        match row {
+            0 => {
+                let ms = (self.hold.as_millis() as i64 + step * 50).clamp(0, MAX_HOLD_MS as i64);
+                self.hold = Duration::from_millis(ms as u64);
+            }
+            1 => self.inspection_on = !self.inspection_on,
+            2 => {
+                self.precision = match self.precision {
+                    Precision::Centi => Precision::Milli,
+                    Precision::Milli => Precision::Centi,
+                }
+            }
+            3 => self.bell = !self.bell,
+            4 => self.cycle_font(step as isize),
+            _ => self.look = self.look.next(self.gfx.has_images()),
+        }
+        self.persist();
     }
 
     /// Switch to the next (or previous) digit font and remember it.
@@ -420,6 +741,71 @@ impl App {
         self.history = self.history.filter(|_| len > 0).map(|i| i.min(len - 1));
     }
 
+    /// Take the next scramble from the trainer or the scrambler, if ready.
+    fn next_scramble(&mut self) {
+        if let Some(drill) = &self.drill {
+            if let Some((case, scramble)) = drill.try_next() {
+                self.drill_case = Some(case);
+                self.scramble = scramble;
+            }
+        } else if let Some(s) = self.scrambler.try_next() {
+            self.scramble = s;
+        }
+    }
+
+    /// Start drilling `set`: the cases marked as being learned, or all of
+    /// them, in the set's own session.
+    fn start_drill(&mut self, set: Set) {
+        let progress = &self.data.progress;
+        let cases = Drill::cases_for(set, |c| {
+            progress.get(&c.key()).map(String::as_str) == Some("learning")
+        });
+        self.drill_return = self.data.current;
+        self.data.current = self.data.drill_session(set.name());
+        self.drill = Some(Drill::new(set, cases));
+        self.drill_case = None;
+        self.last_case = None;
+        self.history = None;
+        self.scramble.clear();
+        self.next_scramble();
+        self.persist();
+    }
+
+    fn stop_drill(&mut self) {
+        self.drill = None;
+        self.drill_case = None;
+        self.last_case = None;
+        self.data.current = self.drill_return.min(self.data.sessions.len() - 1);
+        self.reset_scrambler();
+        self.persist();
+    }
+
+    /// Open the cube view for the current scramble, or for solve `solve`.
+    fn open_cube_view(&mut self, solve: Option<usize>) {
+        let size = self.puzzle().size();
+        let name = self.puzzle().name();
+        let (title, scramble) = match solve.and_then(|i| self.solves().get(i).map(|s| (i, s))) {
+            Some((i, s)) => (
+                format!("{name} solve {} scramble", i + 1),
+                s.scramble.clone(),
+            ),
+            None => (format!("{name} scramble"), self.scramble.clone()),
+        };
+        // find out what the terminal can show before choosing how to start
+        self.gfx.ensure_picker();
+        let has_images = self.gfx.has_images();
+        self.cube_view = CubeView::new(title, size, &scramble).map(|mut v| {
+            v.has_images = has_images;
+            // "image" on a terminal without images is half blocks; start there
+            // so the first `m` changes what is drawn
+            v.look = match self.look {
+                Look::Image if !has_images => Look::Blocks,
+                look => look,
+            };
+            v
+        });
+    }
+
     /// Keys while the history browser is open. The list runs newest first, so
     /// "down" moves to older solves (lower indices).
     fn history_key(&mut self, code: KeyCode, selected: usize) {
@@ -436,6 +822,24 @@ impl App {
             KeyCode::Char('d') => self.mark(Some(selected), Penalty::Dnf),
             KeyCode::Char('o') => self.mark(Some(selected), Penalty::Ok),
             KeyCode::Backspace | KeyCode::Delete => self.confirm_delete = Some(selected),
+            KeyCode::Char('v') => self.open_cube_view(Some(selected)),
+            KeyCode::Char('c') => {
+                let text = self.solves().get(selected).and_then(|s| s.comment.clone());
+                self.input = Some(TextInput {
+                    kind: InputKind::Comment(selected),
+                    text: text.unwrap_or_default(),
+                });
+            }
+            KeyCode::Char('y') => {
+                if let Some(solve) = self.solves().get(selected) {
+                    let line = format!(
+                        "{}  {}",
+                        fmt::fmt_solve_list(solve.ms, solve.penalty, self.precision),
+                        solve.scramble
+                    );
+                    self.copy(line);
+                }
+            }
             KeyCode::Esc | KeyCode::Char('h' | 'q') => self.history = None,
             _ => {}
         }
@@ -446,38 +850,92 @@ impl App {
         if self.solves().is_empty() {
             return;
         }
-        self.data.sessions.push(Session::default());
+        self.data.sessions.push(Session::new(self.puzzle()));
         self.data.current = self.data.sessions.len() - 1;
         self.persist();
     }
 
-    /// Remove the current session and all its solves. The last session left
-    /// is emptied instead, so there is always one.
+    /// Remove the current session and all its solves. If it is the last
+    /// session of its puzzle it is emptied instead, so every puzzle you have
+    /// used keeps a session.
     fn delete_session(&mut self) {
-        let sessions = &mut self.data.sessions;
-        if sessions.len() > 1 {
-            sessions.remove(self.data.current);
-            self.data.current = self.data.current.min(sessions.len() - 1);
+        let puzzle = self.puzzle();
+        let of_puzzle = self.data.sessions_of(puzzle);
+        if of_puzzle.len() > 1 {
+            let at = of_puzzle
+                .iter()
+                .position(|&i| i == self.data.current)
+                .unwrap_or(0);
+            self.data.sessions.remove(self.data.current);
+            // stay on the same puzzle: the session that took its place, or
+            // the one before if it was the last
+            let remaining = self.data.sessions_of(puzzle);
+            self.data.current = remaining[at.min(remaining.len() - 1)];
         } else {
-            sessions[0] = Session::default();
+            self.data.sessions[self.data.current] = Session::new(puzzle);
         }
         self.persist();
     }
 
+    /// Move to the previous (-1) or next (+1) session of the same puzzle.
     fn switch_session(&mut self, step: isize) {
-        let next = self.data.current.checked_add_signed(step);
-        if let Some(i) = next.filter(|&i| i < self.data.sessions.len()) {
+        let of_puzzle = self.data.sessions_of(self.puzzle());
+        let at = of_puzzle
+            .iter()
+            .position(|&i| i == self.data.current)
+            .unwrap_or(0);
+        if let Some(&i) = at.checked_add_signed(step).and_then(|k| of_puzzle.get(k)) {
             self.data.current = i;
             self.persist();
         }
     }
 
+    /// Switch to `puzzle`: its most recent session, or a new one if you have
+    /// never timed it.
+    fn select_puzzle(&mut self, puzzle: Puzzle) {
+        if puzzle == self.puzzle() {
+            return;
+        }
+        let existing = self.data.sessions_of(puzzle).last().copied();
+        self.data.current = existing.unwrap_or_else(|| {
+            self.data.sessions.push(Session::new(puzzle));
+            self.data.sessions.len() - 1
+        });
+        self.history = None;
+        self.reset_scrambler();
+        self.persist();
+    }
+
+    /// Keys while the puzzle picker is open.
+    fn picker_key(&mut self, code: KeyCode, selected: usize) {
+        let last = puzzle::ALL.len() - 1;
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => self.picker = Some(selected.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => self.picker = Some((selected + 1).min(last)),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.picker = None;
+                self.select_puzzle(puzzle::ALL[selected]);
+            }
+            // 2..7 pick a cube by its size
+            KeyCode::Char(c @ '2'..='7') => {
+                self.picker = None;
+                let size = c.to_digit(10).unwrap_or(3) as usize;
+                if let Some(&p) = puzzle::ALL.iter().find(|p| p.size() == size) {
+                    self.select_puzzle(p);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('e' | 'q') => self.picker = None,
+            _ => {}
+        }
+    }
+
     /// Periodic work: the inspection warning bell.
     pub fn tick(&mut self, now: Instant) {
-        if self.scramble.is_empty()
-            && let Some(s) = self.scrambler.try_next()
-        {
-            self.scramble = s;
+        if let Some(view) = self.cube_view.as_mut() {
+            view.tick(now);
+        }
+        if self.scramble.is_empty() {
+            self.next_scramble();
         }
         if self
             .pb_flash
@@ -555,10 +1013,16 @@ impl App {
                     (true, false) => "hold space, release to start",
                     (false, false) => "space: start",
                 };
+                // while training, say which case the last solve was
+                let hint = match (&self.drill, self.last_case) {
+                    (Some(_), Some(case)) => format!("that was {}:  {}", case.title(), case.alg),
+                    (Some(d), None) => format!("{} trainer: {}", d.set.name(), hint),
+                    _ => hint.into(),
+                };
                 View {
                     text,
                     tone: Tone::Idle,
-                    hint: hint.into(),
+                    hint,
                 }
             }
             State::Inspection { start } => {
@@ -576,7 +1040,7 @@ impl App {
                 }
             }
             State::Holding { since, inspection } => {
-                let ready = now.duration_since(since) >= HOLD_READY;
+                let ready = now.duration_since(since) >= self.hold;
                 let text = match inspection {
                     Some(start) => {
                         fmt::fmt_inspection(now.duration_since(start).as_millis() as u64)
@@ -1510,4 +1974,823 @@ mod tests {
         assert_eq!((app.data.current, app.data.sessions.len()), (0, 1));
         assert_eq!(app.solves()[0].ms, 1_000);
     }
+
+    #[test]
+    fn the_picker_switches_puzzle_and_keeps_each_puzzles_solves_apart() {
+        let mut app = with_solves(&[1_000, 2_000]);
+        assert_eq!(app.puzzle(), Puzzle::Cube3);
+        key(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.picker, Some(1)); // opens on the current puzzle
+        key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.picker, None);
+        assert_eq!(app.puzzle(), Puzzle::Cube4);
+        assert!(app.solves().is_empty(), "a new 4x4 session");
+        app.data
+            .solves_mut()
+            .push(Solve::new(50_000, Penalty::Ok, String::new()));
+        // back to 3x3: its own session, untouched
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.puzzle(), Puzzle::Cube3);
+        assert_eq!(app.solves().len(), 2);
+        // and 4x4 again finds its session instead of making another
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.solves().len(), 1);
+        assert_eq!(app.data.sessions.len(), 2);
+    }
+
+    #[test]
+    fn the_picker_can_be_driven_by_arrows_and_cancelled() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Up); // 3x3 -> 2x2
+        key(&mut app, KeyCode::Up); // stays at the top
+        assert_eq!(app.picker, Some(0));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.puzzle(), Puzzle::Cube2);
+        key(&mut app, KeyCode::Char('e'));
+        for _ in 0..10 {
+            key(&mut app, KeyCode::Down);
+        }
+        assert_eq!(app.picker, Some(puzzle::ALL.len() - 1)); // stops at 7x7
+        key(&mut app, KeyCode::Esc);
+        assert_eq!((app.picker, app.puzzle()), (None, Puzzle::Cube2));
+    }
+
+    #[test]
+    fn picker_keys_do_not_leak_to_the_timer() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, SPACE); // picks the highlighted 3x3, doesn't start inspection
+        assert_eq!(app.state, State::Idle);
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn picking_the_current_puzzle_changes_nothing() {
+        let mut app = with_solves(&[1_000]);
+        settle(&mut app);
+        let before = app.scramble.clone();
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.scramble, before);
+        assert_eq!(app.data.sessions.len(), 1);
+    }
+
+    #[test]
+    fn a_new_puzzle_gets_its_own_kind_of_scramble() {
+        use crate::nxn;
+        let mut app = App::new(true);
+        for (digit, size) in [('2', 2), ('5', 5), ('7', 7), ('3', 3)] {
+            key(&mut app, KeyCode::Char('e'));
+            key(&mut app, KeyCode::Char(digit));
+            settle(&mut app);
+            let moves = nxn::parse(&app.scramble).unwrap();
+            match size {
+                2 => assert!(moves.len() <= 11),
+                3 => assert!(moves.len() <= 21),
+                n => assert_eq!(moves.len(), nxn::scramble_length(n)),
+            }
+        }
+    }
+
+    #[test]
+    fn switching_puzzle_clears_the_old_scramble_until_the_new_one_arrives() {
+        let mut app = App::new(true);
+        settle(&mut app);
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('6'));
+        // never the old 3x3 scramble on a 6x6
+        assert!(
+            app.scramble.is_empty() || app.scramble.contains('w'),
+            "{}",
+            app.scramble
+        );
+    }
+
+    #[test]
+    fn solves_keep_the_scramble_of_their_own_puzzle() {
+        let t = Instant::now();
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('5'));
+        settle(&mut app);
+        let scramble = app.scramble.clone();
+        solve_at(&mut app, t, 5_000);
+        assert_eq!(app.solves()[0].scramble, scramble);
+        assert_eq!(app.data.sessions[app.data.current].puzzle, "555");
+    }
+
+    #[test]
+    fn sessions_navigate_and_start_within_the_current_puzzle() {
+        let mut app = with_solves(&[1_000]); // 3x3 session 0
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('2')); // 2x2 session 1
+        app.data
+            .solves_mut()
+            .push(Solve::new(3_000, Penalty::Ok, String::new()));
+        key(&mut app, KeyCode::Char('n')); // 2x2 session 2
+        assert_eq!(app.data.sessions[app.data.current].puzzle, "222");
+        app.data
+            .solves_mut()
+            .push(Solve::new(4_000, Penalty::Ok, String::new()));
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('3'));
+        key(&mut app, KeyCode::Char('n')); // 3x3 session, appended after the 2x2 ones
+        app.data
+            .solves_mut()
+            .push(Solve::new(2_000, Penalty::Ok, String::new()));
+        assert_eq!(app.data.sessions.len(), 4);
+        // [ goes to the other 3x3 session, skipping both 2x2 ones
+        key(&mut app, KeyCode::Char('['));
+        assert_eq!(app.solves()[0].ms, 1_000);
+        key(&mut app, KeyCode::Char('['));
+        assert_eq!(app.solves()[0].ms, 1_000, "no earlier 3x3 session");
+        key(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.solves()[0].ms, 2_000);
+        key(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.solves()[0].ms, 2_000, "no later 3x3 session");
+    }
+
+    #[test]
+    fn deleting_a_session_never_leaves_its_puzzle() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('4'));
+        app.data
+            .solves_mut()
+            .push(Solve::new(9_000, Penalty::Ok, String::new()));
+        key(&mut app, KeyCode::Char('X'));
+        key(&mut app, KeyCode::Char('y'));
+        // the only 4x4 session is emptied, not removed, and we stay on 4x4
+        assert_eq!(app.puzzle(), Puzzle::Cube4);
+        assert!(app.solves().is_empty());
+        assert_eq!(app.data.sessions.len(), 2);
+        // with two 4x4 sessions, deleting one lands on the other 4x4
+        app.data
+            .solves_mut()
+            .push(Solve::new(9_000, Penalty::Ok, String::new()));
+        key(&mut app, KeyCode::Char('n'));
+        app.data
+            .solves_mut()
+            .push(Solve::new(8_000, Penalty::Ok, String::new()));
+        key(&mut app, KeyCode::Char('X'));
+        key(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.puzzle(), Puzzle::Cube4);
+        assert_eq!(app.solves()[0].ms, 9_000);
+        assert_eq!(app.data.sessions.len(), 2);
+    }
+
+    #[test]
+    fn the_puzzle_survives_a_restart() {
+        let dir =
+            std::env::temp_dir().join(format!("cubetimer-puzzle-test-{}", std::process::id()));
+        let path = dir.join("sessions.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new(true).with_storage(path.clone(), store::load(&path));
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Char('5'));
+        let mut app = App::new(true).with_storage(path.clone(), store::load(&path));
+        assert_eq!(app.puzzle(), Puzzle::Cube5);
+        settle(&mut app);
+        assert_eq!(crate::nxn::parse(&app.scramble).unwrap().len(), 60);
+    }
+
+    #[test]
+    fn v_opens_the_cube_view_and_its_keys_stay_inside_it() {
+        let mut app = App::new(true);
+        settle(&mut app);
+        key(&mut app, KeyCode::Char('v'));
+        let view = app.cube_view.as_ref().expect("open");
+        assert_eq!(view.player.frame(Instant::now()).0.size(), 3);
+        assert_eq!(
+            view.player.steps().len(),
+            crate::nxn::parse(&app.scramble).unwrap().len()
+        );
+        // space plays the scramble instead of starting inspection
+        key(&mut app, SPACE);
+        assert!(app.cube_view.as_ref().unwrap().player.is_playing());
+        assert_eq!(app.state, State::Idle);
+        assert!(app.tick_interval().is_some(), "animates on ticks");
+        key(&mut app, KeyCode::Char('q'));
+        assert!(app.cube_view.is_none());
+        assert!(!app.quit, "q closes the view, not the app");
+        // not while inspecting
+        key(&mut app, SPACE);
+        key(&mut app, KeyCode::Char('v'));
+        assert!(app.cube_view.is_none());
+    }
+
+    #[test]
+    fn holding_an_arrow_keeps_turning_the_cube() {
+        let mut app = App::new(true);
+        settle(&mut app); // a scramble to play
+        key(&mut app, KeyCode::Char('v'));
+        let t = Instant::now();
+        let start = app.cube_view.as_ref().unwrap().camera;
+        app.on_key(press(KeyCode::Left), t);
+        app.on_key(press(KeyCode::Left), t); // Ghostty-style repeat
+        let rep = KeyEvent::new_with_kind(KeyCode::Left, KeyModifiers::NONE, KeyEventKind::Repeat);
+        app.on_key(rep, t); // kitty-style repeat
+        let yaw = app.cube_view.as_ref().unwrap().camera.yaw;
+        assert!(
+            ((start.yaw - yaw).rem_euclid(360.0) - 45.0).abs() < 1e-9,
+            "three turns of 15"
+        );
+        // but a held space doesn't toggle play on every repeat
+        app.on_key(press(SPACE), t);
+        app.on_key(press(SPACE), t);
+        assert!(app.cube_view.as_ref().unwrap().player.is_playing());
+    }
+
+    #[test]
+    fn v_in_history_shows_that_solves_scramble() {
+        let mut app = with_solves(&[1_000, 2_000]);
+        app.data.solves_mut()[0].scramble = "R U R'".into();
+        key(&mut app, KeyCode::Char('h'));
+        key(&mut app, KeyCode::Down); // solve 1
+        key(&mut app, KeyCode::Char('v'));
+        let view = app.cube_view.as_ref().unwrap();
+        assert_eq!(view.title, "3x3 solve 1 scramble");
+        assert_eq!(view.player.steps().len(), 3);
+        key(&mut app, KeyCode::Esc);
+        assert!(app.cube_view.is_none());
+        assert_eq!(app.history, Some(0), "back in the history browser");
+    }
+
+    #[test]
+    fn s_opens_the_statistics_screen_and_keys_change_the_range() {
+        let mut app = with_solves(&[10_000, 11_000, 12_000]);
+        key(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.stats.as_ref().unwrap().range, Range::Last100);
+        key(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.stats.as_ref().unwrap().range, Range::Last500);
+        key(&mut app, KeyCode::Char('r'));
+        key(&mut app, KeyCode::Char('r'));
+        assert_eq!(
+            app.stats.as_ref().unwrap().range,
+            Range::Last50,
+            "wraps around"
+        );
+        for (digit, range) in [
+            ('1', Range::Last50),
+            ('2', Range::Last100),
+            ('3', Range::Last500),
+            ('4', Range::All),
+        ] {
+            key(&mut app, KeyCode::Char(digit));
+            assert_eq!(app.stats.as_ref().unwrap().range, range);
+        }
+        key(&mut app, KeyCode::Esc);
+        assert!(app.stats.is_none());
+        key(&mut app, KeyCode::Char('s'));
+        key(&mut app, KeyCode::Char('s'));
+        assert!(app.stats.is_none(), "s closes it too");
+        key(&mut app, KeyCode::Char('s'));
+        key(&mut app, KeyCode::Char('q'));
+        assert!(
+            app.stats.is_none() && !app.quit,
+            "q closes the screen, not the app"
+        );
+    }
+
+    #[test]
+    fn the_statistics_screen_is_a_snapshot_with_the_right_numbers() {
+        let mut app = with_solves(&[2_000, 4_000, 6_000, 8_000, 10_000]);
+        app.data.solves_mut()[1].penalty = Penalty::Plus2;
+        app.data.solves_mut()[2].penalty = Penalty::Dnf;
+        key(&mut app, KeyCode::Char('s'));
+        let view = app.stats.as_ref().unwrap();
+        assert_eq!((view.plus2, view.dnf), (1, 1));
+        assert_eq!(view.report.count, 5);
+        assert_eq!(view.report.finished, 4);
+    }
+
+    #[test]
+    fn statistics_keys_do_not_leak_to_the_timer() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('s'));
+        key(&mut app, SPACE);
+        key(&mut app, KeyCode::Char('d'));
+        key(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.state, State::Idle);
+        assert_eq!(app.solves()[0].penalty, Penalty::Ok);
+        assert!(app.history.is_none());
+        assert!(app.stats.is_some());
+    }
+
+    #[test]
+    fn statistics_open_only_when_idle_and_ctrl_c_still_quits() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, SPACE); // inspecting
+        key(&mut app, KeyCode::Char('s'));
+        assert!(app.stats.is_none());
+        let ctrl_c = KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        );
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('s'));
+        app.on_key(ctrl_c, Instant::now());
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn statistics_work_for_an_empty_session() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('s'));
+        let view = app.stats.as_ref().unwrap();
+        assert_eq!(view.report.count, 0);
+    }
+
+    #[test]
+    fn the_cube_look_is_remembered_across_views_and_restarts() {
+        let dir = std::env::temp_dir().join(format!("cubetimer-look-test-{}", std::process::id()));
+        let path = dir.join("sessions.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new(true).with_storage(path.clone(), store::load(&path));
+        settle(&mut app);
+        assert_eq!(app.look, Look::Image);
+        key(&mut app, KeyCode::Char('v'));
+        // no images in a test, so the view starts as half blocks and the
+        // first press already changes what is drawn
+        assert_eq!(app.cube_view.as_ref().unwrap().look, Look::Blocks);
+        key(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.look, Look::Ascii);
+        key(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.look, Look::Mono);
+        key(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.look, Look::Blocks);
+        key(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.look, Look::Ascii);
+        key(&mut app, KeyCode::Esc);
+        // the next view starts in the same look
+        key(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.cube_view.as_ref().unwrap().look, Look::Ascii);
+        key(&mut app, KeyCode::Esc);
+        // and so does the next run
+        let mut again = App::new(true).with_storage(path.clone(), store::load(&path));
+        assert_eq!(again.look, Look::Ascii);
+        settle(&mut again);
+        key(&mut again, KeyCode::Char('v'));
+        assert_eq!(again.cube_view.as_ref().unwrap().look, Look::Ascii);
+    }
+
+    #[test]
+    fn an_unknown_saved_look_falls_back_to_the_default() {
+        let mut loaded = store::Loaded {
+            data: Data::default(),
+            warning: None,
+        };
+        loaded.data.settings.look = "from-a-newer-version".into();
+        let app = App::new(true).with_storage(PathBuf::from("/nonexistent/sessions.json"), loaded);
+        assert_eq!(app.look, Look::default());
+    }
+
+    #[test]
+    fn a_opens_the_algorithm_browser_and_enter_shows_the_case_in_3d() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('a'));
+        assert!(app.algs.is_some());
+        // T-perm is the 16th PLL
+        for _ in 0..15 {
+            key(&mut app, KeyCode::Right);
+        }
+        assert_eq!(app.algs.as_ref().unwrap().case().name, "T");
+        key(&mut app, KeyCode::Enter);
+        let view = app.cube_view.as_ref().expect("the 3D view opens");
+        assert!(view.title.starts_with("T-perm"));
+        assert_eq!(view.player.pos(), 0, "it starts at the case, not the end");
+        let labels: Vec<&str> = view
+            .player
+            .steps()
+            .iter()
+            .map(|s| s.label.as_str())
+            .collect();
+        assert_eq!(labels.join(" "), "R U R' U' R' F R2 U' R' U' R U R' F'");
+        // playing it to the end solves the case
+        key(&mut app, KeyCode::End);
+        let (cube, _) = app.cube_view.as_ref().unwrap().player.frame(Instant::now());
+        let f = cube.facelets();
+        assert!(
+            (0..6).all(|k| f[k * 9..k * 9 + 9].iter().all(|&c| c == f[k * 9 + 4])),
+            "solved"
+        );
+        // closing the view goes back to the browser, not the timer
+        key(&mut app, KeyCode::Esc);
+        assert!(app.cube_view.is_none());
+        assert!(app.algs.is_some());
+        key(&mut app, KeyCode::Esc);
+        assert!(app.algs.is_none());
+    }
+
+    #[test]
+    fn marks_cycle_and_are_saved() {
+        let dir = std::env::temp_dir().join(format!("cubetimer-marks-test-{}", std::process::id()));
+        let path = dir.join("sessions.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new(true).with_storage(path.clone(), store::load(&path));
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('m'));
+        assert_eq!(
+            app.data.progress.get("PLL:Aa").map(String::as_str),
+            Some("learning")
+        );
+        key(&mut app, KeyCode::Char('m'));
+        assert_eq!(
+            app.data.progress.get("PLL:Aa").map(String::as_str),
+            Some("learned")
+        );
+        let again = store::load(&path).data;
+        assert_eq!(
+            again.progress.get("PLL:Aa").map(String::as_str),
+            Some("learned")
+        );
+        // a third press goes back to new, which isn't stored at all
+        key(&mut app, KeyCode::Char('m'));
+        assert!(app.data.progress.is_empty());
+        assert!(store::load(&path).data.progress.is_empty());
+    }
+
+    #[test]
+    fn browser_keys_do_not_leak_to_the_timer() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('a'));
+        for k in [
+            KeyCode::Char('d'),
+            KeyCode::Char('h'),
+            KeyCode::Char('s'),
+            KeyCode::Char('n'),
+        ] {
+            key(&mut app, k);
+        }
+        assert_eq!(app.solves()[0].penalty, Penalty::Ok);
+        assert!(app.history.is_none() && app.stats.is_none());
+        assert_eq!(app.data.sessions.len(), 1);
+        key(&mut app, KeyCode::Char('q'));
+        assert!(
+            app.algs.is_none() && !app.quit,
+            "q closes the browser, not the app"
+        );
+    }
+
+    #[test]
+    fn holding_an_arrow_moves_through_the_cases() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('a'));
+        let t = Instant::now();
+        app.on_key(press(KeyCode::Right), t);
+        app.on_key(press(KeyCode::Right), t); // repeat as a press
+        let rep = KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::NONE, KeyEventKind::Repeat);
+        app.on_key(rep, t);
+        assert_eq!(app.algs.as_ref().unwrap().selected, 3);
+    }
+
+    #[test]
+    fn training_drills_cases_in_their_own_session_and_t_stops_it() {
+        let t = Instant::now();
+        let mut app = with_solves(&[9_000]);
+        app.inspection_on = false;
+        // mark two PLLs as learning, then train PLL from the browser
+        app.data.progress.insert("PLL:T".into(), "learning".into());
+        app.data.progress.insert("PLL:Y".into(), "learning".into());
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('t'));
+        assert!(app.algs.is_none(), "the browser closes");
+        let drill = app.drill.as_ref().expect("training");
+        assert_eq!(
+            drill.cases.iter().map(|c| c.name).collect::<Vec<_>>(),
+            ["T", "Y"]
+        );
+        assert_eq!(
+            app.data.sessions[app.data.current].drill.as_deref(),
+            Some("PLL")
+        );
+        assert!(app.solves().is_empty(), "a fresh drill session");
+        settle(&mut app);
+        let case = app.drill_case.expect("the scramble's case");
+        assert!(["T", "Y"].contains(&case.name));
+        // a solve is tagged with its case, and the hint names it
+        solve_at(&mut app, t, 2_000);
+        assert_eq!(app.solves()[0].case, Some(case.key()));
+        let hint = app.view(Instant::now()).hint;
+        assert!(
+            hint.starts_with(&format!("that was {}", case.title())),
+            "{hint}"
+        );
+        // sessions and puzzles stay put while training
+        for k in ['n', 'e', '[', ']'] {
+            key(&mut app, KeyCode::Char(k));
+        }
+        assert!(app.picker.is_none());
+        assert_eq!(
+            app.data.sessions[app.data.current].drill.as_deref(),
+            Some("PLL")
+        );
+        // t stops and goes back to the normal session
+        key(&mut app, KeyCode::Char('t'));
+        assert!(app.drill.is_none());
+        assert_eq!(app.solves()[0].ms, 9_000);
+        assert!(app.solves()[0].case.is_none());
+        settle(&mut app);
+        assert!(
+            crate::nxn::parse(&app.scramble).is_some(),
+            "normal scrambles again"
+        );
+    }
+
+    #[test]
+    fn training_with_nothing_marked_drills_the_whole_set() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Tab); // OLL
+        key(&mut app, KeyCode::Char('t'));
+        let drill = app.drill.as_ref().unwrap();
+        assert_eq!((drill.set, drill.cases.len()), (Set::Oll, 57));
+    }
+
+    #[test]
+    fn a_run_saved_while_training_restarts_in_a_normal_session() {
+        let dir = std::env::temp_dir().join(format!("cubetimer-drill-test-{}", std::process::id()));
+        let path = dir.join("sessions.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new(true).with_storage(path.clone(), store::load(&path));
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('t'));
+        assert!(app.drill.is_some());
+        // quit without stopping: the file says we were in the drill session
+        let saved = store::load(&path).data;
+        assert!(saved.sessions[saved.current].drill.is_some());
+        let again = App::new(true).with_storage(path.clone(), store::load(&path));
+        assert!(again.drill.is_none());
+        assert!(again.data.sessions[again.data.current].drill.is_none());
+        assert_eq!(again.puzzle(), Puzzle::Cube3);
+    }
+
+    #[test]
+    fn the_hold_time_setting_changes_when_the_timer_is_ready() {
+        let t = Instant::now();
+        let mut app = App::new(true);
+        app.inspection_on = false;
+        app.hold = Duration::from_millis(600);
+        app.on_key(press(SPACE), t);
+        app.on_key(release(SPACE), at(t, 500)); // too early for 600 ms
+        assert_eq!(app.state, State::Idle);
+        app.on_key(press(SPACE), at(t, 1_000));
+        app.on_key(release(SPACE), at(t, 1_600));
+        assert!(matches!(app.state, State::Running { .. }));
+        // zero means no hold at all
+        let mut app = App::new(true);
+        app.inspection_on = false;
+        app.hold = Duration::ZERO;
+        app.on_key(press(SPACE), t);
+        app.on_key(release(SPACE), at(t, 1));
+        assert!(matches!(app.state, State::Running { .. }));
+    }
+
+    #[test]
+    fn settings_screen_changes_save_and_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("cubetimer-settings2-{}", std::process::id()));
+        let path = dir.join("sessions.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new(true).with_storage(path.clone(), store::load(&path));
+        assert_eq!(app.hold, HOLD_READY);
+        key(&mut app, KeyCode::Char(','));
+        assert_eq!(app.settings_row, Some(0));
+        key(&mut app, KeyCode::Right);
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.hold, Duration::from_millis(400));
+        key(&mut app, KeyCode::Down); // inspection
+        key(&mut app, KeyCode::Left);
+        assert!(!app.inspection_on);
+        key(&mut app, KeyCode::Down); // precision
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.precision, Precision::Milli);
+        key(&mut app, KeyCode::Down); // bell
+        key(&mut app, KeyCode::Right);
+        assert!(app.bell);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.settings_row, None);
+        let again = App::new(true).with_storage(path.clone(), store::load(&path));
+        assert_eq!(again.hold, Duration::from_millis(400));
+        assert!(!again.inspection_on && again.bell);
+        assert_eq!(again.precision, Precision::Milli);
+    }
+
+    #[test]
+    fn hold_time_stays_between_zero_and_a_second() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char(','));
+        for _ in 0..40 {
+            key(&mut app, KeyCode::Left);
+        }
+        assert_eq!(app.hold, Duration::ZERO);
+        for _ in 0..40 {
+            key(&mut app, KeyCode::Right);
+        }
+        assert_eq!(app.hold, Duration::from_millis(MAX_HOLD_MS));
+        // a hand-edited file can't set an absurd hold either
+        let mut loaded = store::Loaded {
+            data: Data::default(),
+            warning: None,
+        };
+        loaded.data.settings.hold_ms = 99_999;
+        let app = App::new(true).with_storage(PathBuf::from("/nonexistent/s.json"), loaded);
+        assert_eq!(app.hold, Duration::from_millis(MAX_HOLD_MS));
+    }
+
+    #[test]
+    fn precision_shows_in_the_timer_display() {
+        let mut app = with_solves(&[12_345]);
+        assert_eq!(app.view(Instant::now()).text, "12.34");
+        app.precision = Precision::Milli;
+        assert_eq!(app.view(Instant::now()).text, "12.345");
+    }
+
+    #[test]
+    fn settings_keys_do_not_leak_to_the_timer() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char(','));
+        for k in [
+            SPACE,
+            KeyCode::Char('d'),
+            KeyCode::Char('h'),
+            KeyCode::Char('q'),
+        ] {
+            key(&mut app, k);
+        }
+        assert_eq!(app.state, State::Idle);
+        assert_eq!(app.solves()[0].penalty, Penalty::Ok);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn typing_a_session_name_saves_it_and_empty_clears_it() {
+        let mut app = with_solves(&[1_000]);
+        key(&mut app, KeyCode::Char('r'));
+        assert!(app.input.is_some());
+        for c in "one-handed".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Backspace);
+        key(&mut app, KeyCode::Char('!'));
+        // while typing, keys are text: space and q don't start or quit
+        key(&mut app, SPACE);
+        key(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit && app.state == State::Idle);
+        key(&mut app, KeyCode::Enter);
+        assert!(app.input.is_none());
+        assert_eq!(app.data.sessions[0].name.as_deref(), Some("one-hande! q"));
+        // reopening shows the current name to edit; clearing it removes it
+        key(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.input.as_ref().unwrap().text, "one-hande! q");
+        for _ in 0..20 {
+            key(&mut app, KeyCode::Backspace);
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.data.sessions[0].name, None);
+        // escape cancels
+        key(&mut app, KeyCode::Char('r'));
+        key(&mut app, KeyCode::Char('x'));
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.data.sessions[0].name, None);
+    }
+
+    #[test]
+    fn names_are_limited_and_not_for_drill_sessions() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('r'));
+        for _ in 0..200 {
+            key(&mut app, KeyCode::Char('a'));
+        }
+        assert_eq!(app.input.as_ref().unwrap().text.chars().count(), 80);
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('t'));
+        key(&mut app, KeyCode::Char('r'));
+        assert!(app.input.is_none(), "a trainer session isn't renamed");
+    }
+
+    #[test]
+    fn comments_are_added_to_any_solve_from_the_history() {
+        let mut app = with_solves(&[1_000, 2_000, 3_000]);
+        key(&mut app, KeyCode::Char('h'));
+        key(&mut app, KeyCode::Down); // the middle solve
+        key(&mut app, KeyCode::Char('c'));
+        for c in "lockup".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.solves()[1].comment.as_deref(), Some("lockup"));
+        assert!(app.solves()[0].comment.is_none() && app.solves()[2].comment.is_none());
+        assert_eq!(app.history, Some(1), "still in the history");
+    }
+
+    #[test]
+    fn clipboard_sequences_are_correct_osc_52() {
+        // RFC 4648 test vectors
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(plain.as_bytes()), encoded);
+        }
+        assert_eq!(clipboard_sequence("R U"), "\x1b]52;c;UiBV\x07");
+        // non-ASCII text is sent as UTF-8
+        assert_eq!(base64("é".as_bytes()), "w6k=");
+    }
+
+    #[test]
+    fn y_copies_the_scramble_the_solve_and_the_averages() {
+        let mut app = with_solves(&[10_000, 11_000, 12_000, 13_000, 14_000]);
+        app.scramble = "R U F".into();
+        key(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.pending_copy.as_deref(), Some("R U F"));
+        assert!(app.status.as_deref().unwrap().starts_with("copied: R U F"));
+        app.pending_copy = None;
+        app.data.solves_mut()[1].scramble = "D2 B".into();
+        key(&mut app, KeyCode::Char('h'));
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down); // solve 2
+        key(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.pending_copy.as_deref(), Some("11.00  D2 B"));
+        key(&mut app, KeyCode::Esc);
+        app.pending_copy = None;
+        key(&mut app, KeyCode::Char('s'));
+        key(&mut app, KeyCode::Char('y'));
+        assert_eq!(
+            app.pending_copy.as_deref(),
+            Some("(10.00) 11.00 12.00 13.00 (14.00) = 12.00")
+        );
+        app.pending_copy = None;
+        key(&mut app, KeyCode::Char('Y'));
+        assert!(app.pending_copy.is_none(), "no ao12 yet");
+        assert!(app.status.as_deref().unwrap().contains("ao12"));
+    }
+}
+
+/// Helpers for tests in other modules.
+#[cfg(test)]
+pub mod tests_support {
+    use super::*;
+
+    /// Switch to the cube of the given size digit, as the picker would.
+    pub fn set_puzzle(app: &mut App, digit: char) {
+        let size = digit.to_digit(10).unwrap() as usize;
+        let p = puzzle::ALL
+            .iter()
+            .copied()
+            .find(|p| p.size() == size)
+            .unwrap();
+        app.select_puzzle(p);
+    }
+}
+
+/// `text` cut to `max` characters, with `…` if it was longer.
+fn ellipsis(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        text.chars().take(max.saturating_sub(1)).collect::<String>() + "\u{2026}"
+    }
+}
+
+/// Standard base64 (RFC 4648), for the clipboard escape sequence.
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
+            | *chunk.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The escape sequence that asks the terminal to set the clipboard (OSC 52).
+fn clipboard_sequence(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64(text.as_bytes()))
+}
+
+fn write_clipboard(text: &str) -> io::Result<()> {
+    let mut out = io::stdout();
+    out.write_all(clipboard_sequence(text).as_bytes())?;
+    out.flush()
 }

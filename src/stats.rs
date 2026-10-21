@@ -133,6 +133,84 @@ pub fn summarize(results: &[TimeResult]) -> Summary {
     }
 }
 
+/// An average written out the way it is posted: the dropped times in
+/// brackets, then the mean. `(12.10) 13.20 14.00 13.80 (16.43) = 13.67`.
+/// `None` when there aren't `n` solves. Times are in the order they were
+/// solved; DNFs show as `DNF`.
+pub fn ao_details(results: &[TimeResult], n: usize, prec: crate::fmt::Precision) -> Option<String> {
+    use crate::fmt;
+    let avg = ao(results, n)?;
+    let window = &results[results.len() - n..];
+    // drop the best and worst by position, so equal times drop one each
+    let trim = trim_count(n);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| (window[i], i));
+    let dropped: Vec<usize> = order[..trim]
+        .iter()
+        .chain(&order[n - trim..])
+        .copied()
+        .collect();
+    let show = |r: &TimeResult| match r {
+        TimeResult::Ms(ms) => fmt::fmt_time(*ms, prec),
+        TimeResult::Dnf => "DNF".to_string(),
+    };
+    let parts: Vec<String> = window
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            if dropped.contains(&i) {
+                format!("({})", show(r))
+            } else {
+                show(r)
+            }
+        })
+        .collect();
+    Some(format!(
+        "{} = {}",
+        parts.join(" "),
+        fmt::fmt_avg(Some(avg), prec)
+    ))
+}
+
+/// The averages the statistics screen lists.
+pub const REPORT_AVERAGES: [usize; 5] = [5, 12, 50, 100, 1000];
+
+/// Everything on the statistics screen's summary, computed once.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Report {
+    pub count: usize,
+    pub finished: usize,
+    pub best: Option<TimeResult>,
+    /// The slowest finished solve.
+    pub worst: Option<u64>,
+    pub mean: Option<u64>,
+    pub std_dev_ms: Option<f64>,
+    /// `(n, current aoN, best aoN)` for each of `REPORT_AVERAGES`.
+    pub averages: Vec<(usize, Option<TimeResult>, Option<TimeResult>)>,
+}
+
+pub fn report(results: &[TimeResult]) -> Report {
+    let times: Vec<u64> = results
+        .iter()
+        .filter_map(|r| match r {
+            TimeResult::Ms(ms) => Some(*ms),
+            TimeResult::Dnf => None,
+        })
+        .collect();
+    Report {
+        count: results.len(),
+        finished: times.len(),
+        best: best(results),
+        worst: times.iter().copied().max(),
+        mean: session_mean(results),
+        std_dev_ms: crate::chart::std_dev(&times),
+        averages: REPORT_AVERAGES
+            .iter()
+            .map(|&n| (n, ao(results, n), best_ao(results, n)))
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +349,78 @@ mod tests {
         assert_eq!(serde_json::to_string(&Penalty::Ok).unwrap(), "\"ok\"");
         assert_eq!(serde_json::to_string(&Penalty::Plus2).unwrap(), "\"plus2\"");
         assert_eq!(serde_json::to_string(&Penalty::Dnf).unwrap(), "\"dnf\"");
+    }
+
+    #[test]
+    fn report_summarizes_a_session() {
+        let r = report(&[Ms(2000), Ms(4000), Dnf, Ms(6000), Ms(8000)]);
+        assert_eq!((r.count, r.finished), (5, 4));
+        assert_eq!(
+            (r.best, r.worst, r.mean),
+            (Some(Ms(2000)), Some(8000), Some(5000))
+        );
+        assert!((r.std_dev_ms.unwrap() - 2236.07).abs() < 0.01);
+        // 5 solves: ao5 exists (the DNF is the dropped worst), longer ones don't
+        let ao5 = r.averages.iter().find(|a| a.0 == 5).unwrap();
+        assert_eq!(ao5.1, Some(Ms(6000)));
+        assert!(
+            r.averages
+                .iter()
+                .filter(|a| a.0 > 5)
+                .all(|a| a.1.is_none() && a.2.is_none())
+        );
+        assert_eq!(r.averages.len(), REPORT_AVERAGES.len());
+    }
+
+    #[test]
+    fn report_of_nothing_and_of_all_dnfs() {
+        let none = report(&[]);
+        assert_eq!(
+            (none.count, none.finished, none.best, none.worst),
+            (0, 0, None, None)
+        );
+        assert!(none.mean.is_none() && none.std_dev_ms.is_none());
+        let dnfs = report(&[Dnf, Dnf]);
+        assert_eq!((dnfs.count, dnfs.finished, dnfs.best), (2, 0, Some(Dnf)));
+        assert_eq!(dnfs.worst, None);
+    }
+
+    #[test]
+    fn report_handles_a_big_session_quickly() {
+        let results: Vec<TimeResult> = (0..5000).map(|i| Ms(10_000 + (i * 7919) % 4000)).collect();
+        let start = std::time::Instant::now();
+        let r = report(&results);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(r.averages.iter().all(|a| a.1.is_some() && a.2.is_some()));
+    }
+
+    #[test]
+    fn average_details_bracket_the_dropped_times() {
+        use crate::fmt::Precision::Centi;
+        let r = [Ms(12_100), Ms(13_200), Ms(14_000), Ms(13_800), Ms(16_430)];
+        assert_eq!(
+            ao_details(&r, 5, Centi).unwrap(),
+            "(12.10) 13.20 14.00 13.80 (16.43) = 13.67"
+        );
+        // only the last n solves, in order; a DNF is the dropped worst
+        let r = [Ms(1), Ms(10_000), Ms(11_000), Dnf, Ms(9_000), Ms(12_000)];
+        assert_eq!(
+            ao_details(&r, 5, Centi).unwrap(),
+            "10.00 11.00 (DNF) (9.00) 12.00 = 11.00"
+        );
+        // equal times drop one of each
+        let r = [Ms(5_000); 5];
+        assert_eq!(
+            ao_details(&r, 5, Centi).unwrap(),
+            "(5.00) 5.00 5.00 5.00 (5.00) = 5.00"
+        );
+        assert!(ao_details(&r[..4], 5, Centi).is_none());
+        // too many DNFs
+        let r = [Ms(1000), Ms(2000), Ms(3000), Dnf, Dnf];
+        assert!(ao_details(&r, 5, Centi).unwrap().ends_with("= DNF"));
     }
 }
