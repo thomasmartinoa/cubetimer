@@ -81,9 +81,7 @@ already run.
 
 ### Arch Linux (AUR)
 
-```sh
-yay -S cubetimer        # or paru -S cubetimer
-```
+Coming Soon
 
 ### From source
 
