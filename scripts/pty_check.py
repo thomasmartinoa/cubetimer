@@ -241,5 +241,49 @@ check("mouse reporting turns off when the view closes", b"\x1b[?1000l" in closed
 os.write(fd6, b"q")
 check("q quits after using the mouse", wait_exit(pid6) == 0)
 
+# A kitty-protocol terminal (kitty, foot, Ghostty, WezTerm, Alacritty): the
+# timer must ask for shifted characters, so Shift+1 types '!' in a name
+# instead of '1'. Keys are sent the way kitty sends them with those flags:
+# CSI code[:shifted] ; modifiers[:event] u (event 3 is a release).
+def kitty_key(code, shifted=None, release=False):
+    key = f"{code}:{shifted}" if shifted else str(code)
+    mods = "2" if shifted else "1"
+    return f"\x1b[{key};{mods}{':3' if release else ''}u".encode()
+
+def kitty_type(fd, keys):
+    for code, shifted in keys:
+        os.write(fd, kitty_key(code, shifted))
+        os.write(fd, kitty_key(code, shifted, release=True))
+        time.sleep(0.02)
+
+pid10, fd10 = spawn("xterm-kitty")
+out, end, answered = b"", time.time() + 2.5, False
+while time.time() < end:
+    r, _, _ = select.select([fd10], [], [], 0.05)
+    if r:
+        out += os.read(fd10, 65536)
+    if not answered and b"\x1b[?u" in out:
+        os.write(fd10, b"\x1b[?0u\x1b[?62;c")  # protocol supported
+        answered = True
+pushed = re.search(rb"\x1b\[>(\d+)u", out)
+flags = int(pushed.group(1)) if pushed else 0
+check("kitty protocol: no basic mode", "basic mode" not in text(out))
+check("kitty protocol: asks for shifted characters", flags & 4 == 4, f"flags {flags}")
+kitty_type(fd10, [(114, None)])                          # r: name the session
+pump(fd10, 0.3)
+kitty_type(fd10, [(127, None)] * 20)                     # clear the old name
+kitty_type(fd10, [(103, 71), (111, None), (49, 33)])     # Shift+g, o, Shift+1
+kitty_type(fd10, [(13, None)])                           # enter
+pump(fd10, 0.5)
+kitty_type(fd10, [(113, None)])                          # q
+code10 = wait_exit(pid10)
+check("kitty protocol: q quits", code10 == 0, f"exit {code10}")
+try:
+    data = json.load(open(os.path.join(DATA, "cubetimer", "sessions.json")))
+    name = data["sessions"][data["current"]].get("name")
+except Exception as e:
+    name = f"unreadable: {e}"
+check("kitty protocol: Shift+1 types '!' (session named 'Go!')", name == "Go!", repr(name))
+
 print(f"\n{len(failures)} failed" if failures else "\nall passed")
 sys.exit(1 if failures else 0)

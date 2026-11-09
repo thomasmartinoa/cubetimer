@@ -82,7 +82,7 @@ Your solves are saved after every change in `~/.local/share/cubetimer/sessions.j
 ```sh
 cubetimer --export > solves.csv                    # every solve as CSV
 cubetimer --import cstimer.txt --dry-run           # check a csTimer export first
-cubetimer --import cstimer.txt                     # then add its sessions
+cubetimer --import cstimer.txt                     # then add its sessions (again: only new solves)
 ```
 
 ## Terminals

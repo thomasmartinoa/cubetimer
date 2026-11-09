@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- Fixed a crash when a solve's scramble has a move too wide for its cube (`4Rw` on a 3x3,
+  from an imported or hand-edited file): the preview and the 3D view now skip it.
+- Fixed a solve started before its scramble was ready being saved with the next scramble
+  (and, while training, the next case).
+- In kitty, foot, Ghostty, WezTerm and Alacritty, shifted symbols (`!`, `:`, `(`, ...) can now
+  be typed in session names and comments, in any keyboard layout. Ctrl and Alt chords are
+  no longer typed as letters.
+- Importing the same csTimer file twice no longer duplicates your solves: solves you already
+  have (same time, scramble and timestamp) are skipped and counted in the summary.
+- Imported text is cleaned of control characters, and `--export` never writes them or a
+  field that a spreadsheet would run as a formula, so a crafted file can't send escape
+  sequences to your terminal or formulas to your spreadsheet.
+- A damaged `sessions.json` set aside as `.corrupt` no longer replaces one set aside earlier
+  (`.corrupt.2`, ...). A failed save leaves no temp file, and saves also sync the directory.
+- Much faster with big sessions: averages are computed in one sliding pass and the recent
+  times only format what fits. With 50,000 solves the statistics screen opens in about
+  15 ms instead of 0.8 s, and a frame of the running timer takes 2 ms instead of 12.
+- Absurd times in a hand-edited file can no longer overflow the statistics.
+
 ## 0.2.0
 
 - 2x2, 4x4, 5x5, 6x6 and 7x7 next to the 3x3: `e` picks the puzzle, and every puzzle has

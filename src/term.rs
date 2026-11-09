@@ -46,6 +46,11 @@ pub fn enter() -> io::Result<Guard> {
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
                     | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                    // Without this, Shift+1 arrives as '1' with SHIFT and a
+                    // comment can't contain '!', ':' or '('. With it the
+                    // terminal sends the shifted character for the user's own
+                    // keyboard layout.
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
             )
         )?;
         ENHANCED.store(true, Ordering::SeqCst);

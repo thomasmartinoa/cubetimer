@@ -200,17 +200,26 @@ pub struct Loaded {
     pub warning: Option<String>,
 }
 
+/// A CSV field: quoted when it needs to be, without control characters
+/// (the output is often a terminal), and never starting like a formula, so a
+/// spreadsheet can't be made to run one (`=HYPERLINK(...)` as a scramble).
+fn csv_field(f: &str) -> String {
+    let mut f: String = f.chars().filter(|c| !c.is_control()).collect();
+    if f.starts_with(['=', '+', '-', '@']) {
+        f.insert(0, '\'');
+    }
+    if f.contains([',', '"']) {
+        format!("\"{}\"", f.replace('"', "\"\""))
+    } else {
+        f
+    }
+}
+
 /// Every solve as CSV, one row per solve, for spreadsheets and other tools.
 /// Times are in seconds with millisecond precision; `result` is the time with
 /// its penalty applied, or `DNF`.
 pub fn to_csv(data: &Data) -> String {
-    let field = |f: &str| {
-        if f.contains([',', '"', '\n']) {
-            format!("\"{}\"", f.replace('"', "\"\""))
-        } else {
-            f.to_string()
-        }
-    };
+    use std::fmt::Write as _;
     let secs = |ms: u64| format!("{}.{:03}", ms / 1000, ms % 1000);
     let mut out = String::from("session,puzzle,solve,time,penalty,result,scramble,date\n");
     for (si, session) in data.sessions.iter().enumerate() {
@@ -224,13 +233,14 @@ pub fn to_csv(data: &Data) -> String {
                 TimeResult::Ms(ms) => secs(ms),
                 TimeResult::Dnf => "DNF".into(),
             };
-            out += &format!(
-                "{},{},{},{},{penalty},{result},{},{}\n",
+            let _ = writeln!(
+                out,
+                "{},{},{},{},{penalty},{result},{},{}",
                 si + 1,
                 session.puzzle().name(),
                 i + 1,
                 secs(s.ms),
-                field(&s.scramble),
+                csv_field(&s.scramble),
                 fmt::fmt_iso(s.ts)
             );
         }
@@ -242,9 +252,6 @@ pub fn default_path() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("cubetimer").join("sessions.json"))
 }
 
-/// Load sessions. A missing file is an empty store. A file that can't be
-/// parsed is renamed to `*.corrupt` (so the next save can't destroy it) and an
-/// empty store is returned with a warning.
 /// Read the sessions without changing anything on disk. A missing file is an
 /// empty store; an unreadable one is an error saying why.
 pub fn read(path: &Path) -> Result<Data, String> {
@@ -270,13 +277,30 @@ pub fn load(path: &Path) -> Loaded {
     }
 }
 
+/// A name next to `path` that isn't taken: `sessions.json.corrupt`, or
+/// `sessions.json.corrupt.2`, ... so an earlier damaged file set aside is
+/// never replaced by a later one.
+fn free_aside_name(path: &Path) -> PathBuf {
+    let name = |n: u32| {
+        let mut aside = path.as_os_str().to_owned();
+        aside.push(".corrupt");
+        if n > 1 {
+            aside.push(format!(".{n}"));
+        }
+        PathBuf::from(aside)
+    };
+    (1..1000)
+        .map(name)
+        .find(|p| fs::symlink_metadata(p).is_err())
+        .unwrap_or_else(|| name(1000))
+}
+
 fn set_aside(path: &Path, reason: &str) -> Loaded {
-    let mut aside = path.as_os_str().to_owned();
-    aside.push(".corrupt");
+    let aside = free_aside_name(path);
     let warning = match fs::rename(path, &aside) {
         Ok(()) => format!(
             "could not read sessions ({reason}); kept as {}",
-            Path::new(&aside).display()
+            aside.display()
         ),
         Err(e) => format!("could not read sessions ({reason}); could not move it aside: {e}"),
     };
@@ -306,19 +330,33 @@ pub fn lock(path: &Path) -> io::Result<Option<File>> {
     }
 }
 
-/// Write atomically: temp file in the same directory, fsync, rename.
+/// Write atomically: temp file in the same directory, fsync, rename, then
+/// fsync the directory so the rename itself survives a power cut. A failed
+/// save leaves the old file as it was and no temp file behind.
 pub fn save(path: &Path, data: &Data) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    if let Some(dir) = dir {
         fs::create_dir_all(dir)?;
     }
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    let mut file = File::create(&tmp)?;
-    file.write_all(&serde_json::to_vec_pretty(data).map_err(io::Error::other)?)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, path)
+    let json = serde_json::to_vec_pretty(data).map_err(io::Error::other)?;
+    let written = File::create(&tmp).and_then(|mut file| {
+        file.write_all(&json)?;
+        file.sync_all()
+    });
+    if let Err(e) = written.and_then(|()| fs::rename(&tmp, path)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // best effort: not every file system can sync a directory
+    if let Some(dir) = dir
+        && let Ok(d) = File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -451,6 +489,58 @@ mod tests {
             comment: None,
         });
         assert!(to_csv(&data).contains(",0.005,\"a,\"\"b\"\"\","));
+    }
+
+    #[test]
+    fn csv_fields_are_safe_for_terminals_and_spreadsheets() {
+        for (scramble, want) in [
+            ("R U", "R U"),
+            ("=HYPERLINK(\"x\")", "\"'=HYPERLINK(\"\"x\"\")\""),
+            ("+1", "'+1"),
+            ("-R", "'-R"),
+            ("@SUM(A1)", "'@SUM(A1)"),
+            ("R\u{1b}[2J U\r\n", "R[2J U"),
+        ] {
+            assert_eq!(csv_field(scramble), want, "{scramble:?}");
+        }
+        let mut data = Data::default();
+        data.solves_mut()
+            .push(Solve::new(1, Penalty::Ok, "a\nb\u{1b}".into()));
+        let csv = to_csv(&data);
+        assert_eq!(csv.lines().count(), 2, "one row per solve");
+        assert!(!csv.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn an_earlier_corrupt_file_is_never_replaced() {
+        let dir = temp_dir("corrupt-twice");
+        let path = dir.join("sessions.json");
+        fs::write(&path, "first").unwrap();
+        load(&path);
+        fs::write(&path, "second").unwrap();
+        let loaded = load(&path);
+        assert!(loaded.warning.unwrap().contains("sessions.json.corrupt.2"));
+        let read = |name: &str| fs::read_to_string(dir.join(name)).unwrap();
+        assert_eq!(read("sessions.json.corrupt"), "first");
+        assert_eq!(read("sessions.json.corrupt.2"), "second");
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_old_file_and_leaves_no_temp_file() {
+        let dir = temp_dir("failed-save");
+        let path = dir.join("sessions.json");
+        save(&path, &sample()).unwrap();
+        // a directory where the temp file goes makes the save fail
+        let tmp = dir.join("sessions.json.tmp");
+        fs::create_dir(&tmp).unwrap();
+        assert!(save(&path, &Data::default()).is_err());
+        assert_eq!(read(&path).unwrap(), sample());
+        fs::remove_dir(&tmp).unwrap();
+        // and a failed rename (the target is a directory) cleans up
+        let other = dir.join("sub");
+        fs::create_dir_all(other.join("sessions.json")).unwrap();
+        assert!(save(&other.join("sessions.json"), &sample()).is_err());
+        assert!(!other.join("sessions.json.tmp").exists());
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::app::{App, Tone};
 use crate::fmt;
 use crate::font;
 use crate::nxn;
-use crate::stats::{Penalty, TimeResult};
+use crate::stats::{Penalty, Summary, TimeResult};
 use crate::statsview;
 use crate::view3d;
 
@@ -129,12 +129,7 @@ fn draw_settings(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
         .collect();
     let width = 40.min(area.width);
     let height = (lines.len() as u16 + 4).min(area.height);
-    let [popup] = Layout::horizontal([Constraint::Length(width)])
-        .flex(Flex::Center)
-        .areas(area);
-    let [popup] = Layout::vertical([Constraint::Length(height)])
-        .flex(Flex::Center)
-        .areas(popup);
+    let popup = centered(area, width, height);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -173,8 +168,20 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn dim() -> Style {
+/// Secondary text: labels, borders, hints.
+pub fn dim() -> Style {
     Style::new().fg(Color::DarkGray)
+}
+
+/// A `width` x `height` rectangle in the middle of `area` (clipped to it).
+pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let [r] = Layout::horizontal([Constraint::Length(width)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [r] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(r);
+    r
 }
 
 /// Lines `text` takes when wrapped at word boundaries to `width` columns,
@@ -273,11 +280,13 @@ fn draw_stats(frame: &mut Frame, area: Rect, app: &App) {
             .areas(area);
         (l, None, r)
     };
-    draw_stats_grid(frame, left, app);
+    // computed once per frame: both panels need it
+    let summary = app.summary();
+    draw_stats_grid(frame, left, app, &summary);
     if let Some(p) = preview {
         draw_preview(frame, p, &app.scramble, app.puzzle().size(), "preview");
     }
-    draw_recent(frame, right, app);
+    draw_recent(frame, right, app, summary.best);
 }
 
 /// This session's place among the sessions of the same puzzle: (2, 3) is the
@@ -291,9 +300,8 @@ fn session_position(app: &App) -> (usize, usize) {
     (at + 1, of_puzzle.len())
 }
 
-fn draw_stats_grid(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_stats_grid(frame: &mut Frame, area: Rect, app: &App, s: &Summary) {
     let prec = app.precision;
-    let s = app.summary();
     // Left column first: with room for only one, these are the ones to keep.
     let left = [
         ("best", fmt::fmt_single(s.best, prec)),
@@ -401,7 +409,7 @@ fn net_grid(scramble: &str, size: usize) -> Option<Vec<Vec<Option<Color>>>> {
     if scramble.is_empty() {
         return None;
     }
-    let moves = nxn::parse(scramble)?;
+    let moves = nxn::parse_for(scramble, size)?;
     let mut cube = nxn::Nxn::solved(size);
     cube.apply_all(&moves);
     Some(net_grid_of(&cube))
@@ -498,12 +506,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
         .collect();
     let height = (lines.len() as u16 + 4).min(area.height);
     let width = 28.min(area.width);
-    let [popup] = Layout::horizontal([Constraint::Length(width)])
-        .flex(Flex::Center)
-        .areas(area);
-    let [popup] = Layout::vertical([Constraint::Length(height)])
-        .flex(Flex::Center)
-        .areas(popup);
+    let popup = centered(area, width, height);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -518,7 +521,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
 
 /// Recent solves, newest first, in aligned columns. +2 and DNF are colored and
 /// the session best is highlighted.
-fn draw_recent(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_recent(frame: &mut Frame, area: Rect, app: &App, best: Option<TimeResult>) {
     let block = Block::bordered()
         .title(" recent times ")
         .border_style(dim());
@@ -526,12 +529,17 @@ fn draw_recent(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
     let prec = app.precision;
     let solves = app.solves();
-    let best = app.summary().best;
     let num_w = solves.len().to_string().len() + 1;
+    // Only format what can be on screen: every cell is at least as wide as
+    // the shortest time ("0.00"), which bounds how many fit. A big session
+    // would otherwise format every solve on every frame of a running timer.
+    let min_cell_w = num_w + 1 + "0.00".len() + 3;
+    let room = inner.height as usize * (inner.width as usize / min_cell_w).max(1);
     let entries: Vec<(usize, String)> = solves
         .iter()
         .enumerate()
         .rev()
+        .take(room)
         .map(|(i, s)| (i, fmt::fmt_solve_list(s.ms, s.penalty, prec)))
         .collect();
     let time_w = entries.iter().map(|(_, t)| t.len()).max().unwrap_or(0);
@@ -684,12 +692,7 @@ const HELP: [(&str, &str); 27] = [
 fn draw_help(frame: &mut Frame, area: Rect) {
     let width = 62.min(area.width);
     let height = (HELP.len() as u16 + 4).min(area.height);
-    let [popup] = Layout::horizontal([Constraint::Length(width)])
-        .flex(Flex::Center)
-        .areas(area);
-    let [popup] = Layout::vertical([Constraint::Length(height)])
-        .flex(Flex::Center)
-        .areas(popup);
+    let popup = centered(area, width, height);
     let lines: Vec<Line> = HELP
         .iter()
         .map(|(k, v)| {
@@ -1214,6 +1217,24 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::REVERSED)
         );
+    }
+
+    #[test]
+    fn a_scramble_too_wide_for_the_cube_does_not_crash() {
+        // an imported or hand-edited 3x3 solve with a 4x4 move in it
+        let mut app = app();
+        app.data.solves_mut()[2].scramble = "R U 4Rw' F".into();
+        app.history = Some(2);
+        let out = render(&app, 120, 40);
+        assert!(out.contains("R U 4Rw' F"), "the scramble is still listed");
+        // and the cube view just doesn't open for it
+        let v = ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('v'),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        );
+        app.on_key(v, Instant::now());
+        assert!(app.cube_view.is_none());
+        render(&app, 120, 40);
     }
 
     #[test]

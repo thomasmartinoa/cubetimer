@@ -29,7 +29,8 @@ impl TimeResult {
     pub fn new(raw_ms: u64, penalty: Penalty) -> Self {
         match penalty {
             Penalty::Ok => Self::Ms(raw_ms),
-            Penalty::Plus2 => Self::Ms(raw_ms + 2000),
+            // saturating: a hand-edited or imported file can hold any number
+            Penalty::Plus2 => Self::Ms(raw_ms.saturating_add(2000)),
             Penalty::Dnf => Self::Dnf,
         }
     }
@@ -40,19 +41,25 @@ fn trim_count(n: usize) -> usize {
     n.div_ceil(20).max(1)
 }
 
+/// Floored mean of `count` times adding up to `sum`. Sums are `u128` so no
+/// number of solves (or absurd time in a hand-edited file) can overflow.
+pub fn floor_mean(sum: u128, count: usize) -> u64 {
+    u64::try_from(sum / count as u128).unwrap_or(u64::MAX)
+}
+
 /// Mean of a set of results, `Dnf` if any is a DNF. `None` when empty.
 fn mean(results: &[TimeResult]) -> Option<TimeResult> {
     if results.is_empty() {
         return None;
     }
-    let mut sum = 0;
+    let mut sum = 0u128;
     for r in results {
         match r {
-            TimeResult::Ms(ms) => sum += ms,
+            TimeResult::Ms(ms) => sum += u128::from(*ms),
             TimeResult::Dnf => return Some(TimeResult::Dnf),
         }
     }
-    Some(TimeResult::Ms(sum / results.len() as u64))
+    Some(TimeResult::Ms(floor_mean(sum, results.len())))
 }
 
 /// Plain mean of the last `n` results (mo3 is `mo(results, 3)`).
@@ -80,30 +87,70 @@ pub fn best(results: &[TimeResult]) -> Option<TimeResult> {
     results.iter().copied().min()
 }
 
+/// The aoN ending at every solve from the `n`th on, as `(index of the last
+/// solve, average)`; the same numbers as calling `ao` on each prefix, but in
+/// one pass. The window is kept sorted (a DNF sorts last), so each step is a
+/// binary-search insert and remove, and the kept times are the window's
+/// finished total minus the few trimmed at each end.
+pub fn rolling_ao(results: &[TimeResult], n: usize) -> Vec<(usize, TimeResult)> {
+    if n < 3 || results.len() < n {
+        return Vec::new();
+    }
+    // a DNF is u64::MAX, so it sorts after every time
+    const DNF: u64 = u64::MAX;
+    let key = |r: TimeResult| match r {
+        TimeResult::Ms(ms) => ms.min(DNF - 1),
+        TimeResult::Dnf => DNF,
+    };
+    let finished = |k: u64| if k == DNF { 0 } else { u128::from(k) };
+    let trim = trim_count(n);
+    let mut sorted: Vec<u64> = Vec::with_capacity(n + 1);
+    // sum of the finished times in the window
+    let mut total = 0u128;
+    let mut out = Vec::with_capacity(results.len() + 1 - n);
+    for (i, &r) in results.iter().enumerate() {
+        let k = key(r);
+        sorted.insert(sorted.partition_point(|&x| x < k), k);
+        total += finished(k);
+        if i >= n {
+            let old = key(results[i - n]);
+            sorted.remove(sorted.partition_point(|&x| x < old));
+            total -= finished(old);
+        }
+        if i + 1 < n {
+            continue;
+        }
+        // more DNFs than are trimmed: one is among the kept times
+        let avg = if sorted[n - trim - 1] == DNF {
+            TimeResult::Dnf
+        } else {
+            let trimmed: u128 = sorted[..trim]
+                .iter()
+                .chain(&sorted[n - trim..])
+                .map(|&k| finished(k))
+                .sum();
+            TimeResult::Ms(floor_mean(total - trimmed, n - 2 * trim))
+        };
+        out.push((i, avg));
+    }
+    out
+}
+
 /// Best aoN over every window of the session.
 pub fn best_ao(results: &[TimeResult], n: usize) -> Option<TimeResult> {
-    if n < 3 || results.len() < n {
-        return None;
-    }
-    (n..=results.len())
-        .filter_map(|end| ao(&results[..end], n))
-        .min()
+    rolling_ao(results, n).into_iter().map(|(_, a)| a).min()
 }
 
 /// Mean of the non-DNF solves, in ms (csTimer's session mean).
 pub fn session_mean(results: &[TimeResult]) -> Option<u64> {
-    let times: Vec<u64> = results
+    let (sum, count) = results
         .iter()
         .filter_map(|r| match r {
-            TimeResult::Ms(ms) => Some(*ms),
+            TimeResult::Ms(ms) => Some(u128::from(*ms)),
             TimeResult::Dnf => None,
         })
-        .collect();
-    if times.is_empty() {
-        None
-    } else {
-        Some(times.iter().sum::<u64>() / times.len() as u64)
-    }
+        .fold((0u128, 0usize), |(s, c), ms| (s + ms, c + 1));
+    (count > 0).then(|| floor_mean(sum, count))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,6 +373,48 @@ mod tests {
     }
 
     #[test]
+    fn rolling_ao_matches_the_average_of_every_prefix() {
+        // a fixed pseudo-random mix of times, ties and DNFs
+        let mut x: u64 = 12_345;
+        let results: Vec<TimeResult> = (0..400)
+            .map(|_| {
+                x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                match (x >> 33) % 13 {
+                    0 => Dnf,
+                    1 => Ms(10_000), // ties
+                    k => Ms(8_000 + k * 517 + (x >> 40) % 3_000),
+                }
+            })
+            .collect();
+        for n in [3, 5, 12, 21, 50, 100] {
+            let rolling = rolling_ao(&results, n);
+            assert_eq!(rolling.len(), results.len() + 1 - n, "ao{n}");
+            for &(i, avg) in &rolling {
+                assert_eq!(Some(avg), ao(&results[..=i], n), "ao{n} at {i}");
+            }
+            let naive = (n..=results.len())
+                .filter_map(|e| ao(&results[..e], n))
+                .min();
+            assert_eq!(best_ao(&results, n), naive, "best ao{n}");
+        }
+        assert!(rolling_ao(&results[..4], 5).is_empty());
+        assert!(rolling_ao(&results, 2).is_empty());
+    }
+
+    #[test]
+    fn absurd_times_saturate_instead_of_overflowing() {
+        // a hand-edited or imported file can hold any u64
+        let huge = u64::MAX - 1;
+        assert_eq!(TimeResult::new(u64::MAX, Penalty::Plus2), Ms(u64::MAX));
+        let r = [Ms(huge), Ms(huge), Ms(huge), Ms(huge), Ms(huge)];
+        assert_eq!(ao(&r, 5), Some(Ms(huge)));
+        assert_eq!(best_ao(&r, 5), Some(Ms(huge)));
+        assert_eq!(mo(&r, 3), Some(Ms(huge)));
+        assert_eq!(session_mean(&r), Some(huge));
+        report(&r);
+    }
+
+    #[test]
     fn best_ao_prefers_real_time_over_dnf() {
         let r = [Dnf, Dnf, Ms(1), Ms(2), Ms(3), Ms(4), Ms(5), Ms(6)];
         assert_eq!(best_ao(&r, 5), Some(Ms(3)));
@@ -387,11 +476,21 @@ mod tests {
 
     #[test]
     fn report_handles_a_big_session_quickly() {
-        let results: Vec<TimeResult> = (0..5000).map(|i| Ms(10_000 + (i * 7919) % 4000)).collect();
+        // a csTimer import can be this big; re-sorting every window took
+        // seconds here, one sliding pass takes milliseconds
+        let results: Vec<TimeResult> = (0..200_000)
+            .map(|i| {
+                if i % 97 == 0 {
+                    Dnf
+                } else {
+                    Ms(10_000 + (i * 7919) % 4000)
+                }
+            })
+            .collect();
         let start = std::time::Instant::now();
         let r = report(&results);
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
+            start.elapsed() < std::time::Duration::from_secs(1),
             "{:?}",
             start.elapsed()
         );

@@ -124,10 +124,12 @@ fn secs(ms: u64) -> f64 {
 /// Rolling average of the last `n` solves ending at each solve from `from`
 /// on (a DNF average is left out), as `(solve number, seconds)`.
 pub fn rolling_ao(results: &[TimeResult], n: usize, from: usize) -> Vec<(f64, f64)> {
-    (from.max(n.saturating_sub(1))..results.len())
-        .filter_map(|i| match stats::ao(&results[..=i], n) {
-            Some(TimeResult::Ms(ms)) => Some(((i + 1) as f64, secs(ms))),
-            _ => None,
+    stats::rolling_ao(results, n)
+        .into_iter()
+        .filter(|&(i, _)| i >= from)
+        .filter_map(|(i, avg)| match avg {
+            TimeResult::Ms(ms) => Some(((i + 1) as f64, secs(ms))),
+            TimeResult::Dnf => None,
         })
         .collect()
 }

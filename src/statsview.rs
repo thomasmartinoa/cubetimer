@@ -13,10 +13,7 @@ use crate::app::App;
 use crate::chart::{self, Range};
 use crate::fmt::{self, Precision};
 use crate::stats::{self, Report, TimeResult};
-
-fn dim() -> Style {
-    Style::new().fg(Color::DarkGray)
-}
+use crate::ui::dim;
 
 /// The statistics screen's state: which solves the chart covers, and the
 /// summary, computed once when the screen opens (the averages over 1000 solves
