@@ -6,8 +6,10 @@
 //! paint: stickers you leave open are filled in for you.
 
 use std::cell::Cell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, MouseButton, MouseEventKind};
@@ -186,8 +188,10 @@ pub struct Editor {
     pub brush: u8,
     /// The answer for the current stickers, once known.
     pub found: Option<Found>,
-    /// A search running in the background, for these stickers.
-    job: Option<([u8; 54], Receiver<Found>)>,
+    /// The search running in the background for the current stickers.
+    job: Option<Job>,
+    /// Earlier stickers, for undo (newest last).
+    history: Vec<[u8; 54]>,
     geometry: Cell<Option<Geometry>>,
 }
 
@@ -200,8 +204,31 @@ fn blank() -> [u8; 54] {
     f
 }
 
-/// How long the editor looks for a shorter way to make a pattern.
-const SHORTEN_FOR: Duration = Duration::from_millis(800);
+/// How many changes undo remembers.
+const UNDO_STEPS: usize = 500;
+
+/// How long the editor keeps looking for a shorter way to make a pattern,
+/// and how much of that it may spend trying short sequences one by one.
+const SEARCH_FOR: Duration = Duration::from_secs(5);
+const SHORT_SEARCH_FOR: Duration = Duration::from_secs(3);
+
+/// The longest sequences the editor tries one by one (all of 7 moves take
+/// about two seconds; longer ones are left to the two-phase solver).
+const SHORT_SEARCH: usize = 7;
+
+/// A search on its own thread. It sends every better answer it finds, and
+/// stops when `stop` is set (the stickers changed) or its time is up.
+#[derive(Debug)]
+struct Job {
+    answers: Receiver<Found>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
 
 impl Default for Editor {
     fn default() -> Self {
@@ -211,6 +238,7 @@ impl Default for Editor {
             brush: 1,
             found: None,
             job: None,
+            history: Vec::new(),
             geometry: Cell::new(None),
         };
         e.changed();
@@ -219,16 +247,35 @@ impl Default for Editor {
 }
 
 impl Editor {
+    /// Replace the stickers (undo brings the old ones back).
     pub fn load(&mut self, stickers: [u8; 54]) {
+        if stickers == self.stickers {
+            return;
+        }
+        if self.history.len() == UNDO_STEPS {
+            self.history.remove(0);
+        }
+        self.history.push(self.stickers);
         self.stickers = stickers;
         self.changed();
     }
 
+    /// Go back one change; `false` if there is none.
+    fn undo(&mut self) -> bool {
+        let Some(before) = self.history.pop() else {
+            return false;
+        };
+        self.stickers = before;
+        self.changed();
+        true
+    }
+
     /// The stickers changed: check them now, and find the moves in the
-    /// background.
+    /// background (stopping the search for the old stickers).
     fn changed(&mut self) {
+        self.job = None;
         self.found = patterns::quick_check(&self.stickers).map(Found::Impossible);
-        if self.found.is_none() && self.job.is_none() {
+        if self.found.is_none() {
             self.start_job();
         }
     }
@@ -236,59 +283,88 @@ impl Editor {
     fn start_job(&mut self) {
         let f = self.stickers;
         let (tx, rx) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
         std::thread::spawn(move || {
-            let found = match patterns::complete(&f) {
-                Ok(state) => Found::Cube {
-                    state,
-                    moves: patterns::moves_to_make(&state, SHORTEN_FOR),
-                },
-                Err(why) => Found::Impossible(why),
+            let state = match patterns::complete(&f) {
+                Ok(state) => state,
+                Err(why) => {
+                    let _ = tx.send(Found::Impossible(why));
+                    return;
+                }
             };
-            let _ = tx.send(found);
+            let start = Instant::now();
+            let stopped = &stopped;
+            let keep_going_for =
+                |time| move || !stopped.load(Ordering::Relaxed) && start.elapsed() < time;
+            // A first answer at once, then: the fewest moves if there is a
+            // short way (any cube matching the painting will do), else
+            // shorter and shorter ways to the filled-in cube.
+            let mut best = usize::MAX;
+            let mut send = |state: Cube, moves: &[Move]| {
+                if moves.len() < best {
+                    best = moves.len();
+                    let _ = tx.send(Found::Cube {
+                        state,
+                        moves: moves.to_vec(),
+                    });
+                }
+            };
+            let first = patterns::first_way(&state);
+            send(state, &first);
+            let short = SHORT_SEARCH.min(first.len().saturating_sub(1));
+            if let Some(moves) = patterns::find_short(&f, short, &keep_going_for(SHORT_SEARCH_FOR))
+            {
+                send(SOLVED.apply_all(&moves), &moves);
+                return;
+            }
+            patterns::shorten(&state, &keep_going_for(SEARCH_FOR), &mut |moves| {
+                send(state, moves)
+            });
         });
-        self.job = Some((f, rx));
+        self.job = Some(Job { answers: rx, stop });
     }
 
-    /// Pick up a finished search; start another if the stickers changed
-    /// while it ran.
+    /// Pick up what the search has found so far.
     pub fn poll(&mut self) {
-        let Some((f, rx)) = &self.job else {
+        let Some(job) = &self.job else {
             return;
         };
-        let found = match rx.try_recv() {
-            Ok(found) => Some(found),
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => None,
-        };
-        let current = *f == self.stickers;
+        loop {
+            match job.answers.try_recv() {
+                Ok(found) => self.found = Some(found),
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
         self.job = None;
-        if current {
-            self.found = found;
-        } else if self.found.is_none() {
-            self.start_job();
+        if self.found.is_none() {
+            self.found = Some(Found::Impossible("the search stopped unexpectedly".into()));
         }
     }
 
-    /// Whether moves are still being looked for.
+    /// Whether the search is still running (a first answer may be shown
+    /// while it looks for a shorter one).
     pub fn working(&self) -> bool {
-        self.found.is_none()
+        self.job.is_some()
     }
 
-    /// Wait for the search to finish (tests).
+    /// Wait for a first answer (tests).
     #[cfg(test)]
     pub fn wait(&mut self) {
-        while self.working() {
+        while self.found.is_none() {
             std::thread::sleep(Duration::from_millis(5));
             self.poll();
         }
     }
 
     fn paint(&mut self, color: u8) {
-        if self.cursor % 9 == 4 || self.stickers[self.cursor] == color {
+        if self.cursor % 9 == 4 {
             return;
         }
-        self.stickers[self.cursor] = color;
-        self.changed();
+        let mut f = self.stickers;
+        f[self.cursor] = color;
+        self.load(f);
     }
 
     /// The next sticker of the same face in reading order, skipping the
@@ -328,10 +404,11 @@ impl Editor {
 
     fn fill_face(&mut self, color: u8) {
         let face = self.cursor / 9;
+        let mut f = self.stickers;
         for k in (0..9).filter(|&k| k != 4) {
-            self.stickers[face * 9 + k] = color;
+            f[face * 9 + k] = color;
         }
-        self.changed();
+        self.load(f);
     }
 
     /// The moves, once found.
@@ -406,6 +483,8 @@ pub enum Action {
     AskMoves,
     /// Delete saved pattern `i`.
     Delete(usize),
+    /// Ask for a new name for saved pattern `i`.
+    Rename(usize),
 }
 
 impl PatternBrowser {
@@ -470,6 +549,7 @@ impl PatternBrowser {
                 self.note = Some(format!("editing a copy of {}", item.name));
                 Action::None
             }
+            KeyCode::Char('r') if self.tab == Tab::Mine => Action::Rename(self.selected),
             KeyCode::Char('d' | 'x') | KeyCode::Delete | KeyCode::Backspace
                 if self.tab == Tab::Mine =>
             {
@@ -514,6 +594,11 @@ impl PatternBrowser {
             KeyCode::Down | KeyCode::Char('j') => e.step(1, 0),
             KeyCode::Left | KeyCode::Char('h') => e.step(0, -1),
             KeyCode::Right | KeyCode::Char('l') => e.step(0, 1),
+            KeyCode::Char('u') => {
+                if !e.undo() {
+                    self.note = Some("nothing to undo".into());
+                }
+            }
             KeyCode::Char('f') => e.fill_face(e.brush),
             KeyCode::Char('F') => e.fill_face(ANY),
             KeyCode::Char('e') => e.load(blank()),
@@ -619,14 +704,41 @@ pub fn draw(
         }
     } else if let Some(note) = &browser.note {
         format!(" {note}")
-    } else if browser.tab == Tab::Create {
-        " arrows move  w r g y o b paint  x open  enter watch in 3D  s save  Y copy  tab next  esc close"
-            .into()
-    } else if browser.tab == Tab::Mine {
-        " arrows move  enter watch in 3D  y copy moves  e edit  d delete  tab next  esc close"
-            .into()
     } else {
-        " arrows move  enter watch in 3D  y copy moves  e edit a copy  tab next  esc close".into()
+        // as many hints as fit, the most useful first
+        let hints: &[(u8, &str)] = match browser.tab {
+            Tab::Create => &[
+                (0, "arrows move"),
+                (0, "w r g y o b paint"),
+                (1, "x open"),
+                (1, "u undo"),
+                (0, "enter 3D"),
+                (1, "s save"),
+                (2, "Y copy"),
+                (2, "a type moves"),
+                (2, "tab next"),
+                (0, "esc close"),
+            ],
+            Tab::Mine => &[
+                (0, "arrows move"),
+                (0, "enter watch in 3D"),
+                (1, "y copy moves"),
+                (1, "e edit"),
+                (1, "r rename"),
+                (1, "d delete"),
+                (2, "tab next"),
+                (0, "esc close"),
+            ],
+            _ => &[
+                (0, "arrows move"),
+                (0, "enter watch in 3D"),
+                (1, "y copy moves"),
+                (1, "e edit a copy"),
+                (2, "tab next"),
+                (0, "esc close"),
+            ],
+        };
+        fit_hints(hints, footer.width as usize)
     };
     let footer_style = if browser.confirm_delete || browser.note.is_some() {
         Style::new().fg(Color::Yellow)
@@ -674,6 +786,28 @@ pub fn draw(
     if wide && let Some(item) = list.get(browser.selected.min(list.len() - 1)) {
         draw_details(frame, details, item, look, gfx);
     }
+}
+
+/// The hints that fit in `width` columns, keeping their order: all of
+/// priority 0 first, then 1, then 2, as long as they fit.
+fn fit_hints(hints: &[(u8, &str)], width: usize) -> String {
+    let mut keep = vec![false; hints.len()];
+    let mut used = 0;
+    for level in 0..=2 {
+        for (i, &(p, text)) in hints.iter().enumerate() {
+            if p == level && used + 2 + text.len() <= width {
+                keep[i] = true;
+                used += 2 + text.len();
+            }
+        }
+    }
+    hints
+        .iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|((_, text), _)| format!(" {text}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A tile: the pattern's net and its name.
@@ -963,6 +1097,7 @@ fn draw_editor_pane(frame: &mut Frame, area: Rect, e: &Editor, look: Look, gfx: 
             key("a"),
             Span::raw(" type moves"),
         ]),
+        Line::from(vec![key("u"), Span::raw(" undo")]),
         Line::default(),
     ]);
     match &e.found {
@@ -984,10 +1119,20 @@ fn draw_editor_pane(frame: &mut Frame, area: Rect, e: &Editor, look: Look, gfx: 
             )));
         }
         Some(Found::Cube { moves, .. }) => {
-            lines.push(Line::from(Span::styled(
-                "\u{2713} a real cube",
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "\u{2713} a real cube",
+                    Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if e.working() {
+                        "   looking for a shorter way..."
+                    } else {
+                        ""
+                    },
+                    Style::new().fg(Color::Yellow),
+                ),
+            ]));
             lines.push(Line::from(Span::styled(
                 format!(
                     "{} moves from solved, white on top, green in front:",
@@ -1143,6 +1288,45 @@ mod tests {
     }
 
     #[test]
+    fn undo_takes_back_paint_fills_and_loads() {
+        let mut b = PatternBrowser {
+            tab: Tab::Create,
+            ..Default::default()
+        };
+        let start = b.editor.stickers;
+        b.key(KeyCode::Char('g'), &[]);
+        b.key(KeyCode::Char('f'), &[]);
+        b.key(KeyCode::Char('n'), &[]);
+        assert_eq!(b.editor.stickers, SOLVED.facelets());
+        b.key(KeyCode::Char('u'), &[]);
+        assert!(
+            b.editor.stickers[18..27].iter().all(|&c| c == 2),
+            "the filled face"
+        );
+        b.key(KeyCode::Char('u'), &[]);
+        b.key(KeyCode::Char('u'), &[]);
+        assert_eq!(b.editor.stickers, start);
+        b.key(KeyCode::Char('u'), &[]);
+        assert_eq!(b.note.as_deref(), Some("nothing to undo"));
+    }
+
+    #[test]
+    fn hints_keep_the_important_ones_on_a_narrow_screen() {
+        let hints = [
+            (0, "arrows move"),
+            (2, "tab next"),
+            (1, "s save"),
+            (0, "esc close"),
+        ];
+        assert_eq!(
+            fit_hints(&hints, 80),
+            " arrows move  tab next  s save  esc close"
+        );
+        assert_eq!(fit_hints(&hints, 34), " arrows move  s save  esc close");
+        assert_eq!(fit_hints(&hints, 26), " arrows move  esc close");
+    }
+
+    #[test]
     fn centers_cannot_be_painted() {
         let mut b = PatternBrowser {
             tab: Tab::Create,
@@ -1176,6 +1360,7 @@ mod tests {
         b.key(KeyCode::Char('d'), &saved);
         assert!(b.confirm_delete);
         assert_eq!(b.key(KeyCode::Char('y'), &saved), Action::Delete(0));
+        assert_eq!(b.key(KeyCode::Char('r'), &saved), Action::Rename(0));
         // anything else keeps it
         b.key(KeyCode::Char('d'), &saved);
         assert_eq!(b.key(KeyCode::Char('n'), &saved), Action::None);

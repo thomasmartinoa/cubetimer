@@ -10,6 +10,7 @@
 //! pieces at home as it can) and `moves_to_make` finds a short way to get
 //! there from solved.
 
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 use crate::alg;
@@ -585,18 +586,161 @@ pub fn complete(f: &[u8; 54]) -> Result<Cube, String> {
     }
 }
 
-/// A short way to make `state` from a solved cube: the two-phase solver's
-/// first answer, then shorter ones until `time` runs out.
-pub fn moves_to_make(state: &Cube, time: Duration) -> Vec<Move> {
+/// Whether a cube's stickers match a painting (`ANY` matches anything).
+#[cfg(test)]
+fn matches(stickers: &[u8; 54], painted: &[u8; 54]) -> bool {
+    stickers
+        .iter()
+        .zip(painted)
+        .all(|(&s, &p)| p == ANY || s == p)
+}
+
+/// A painted sticker to check: where it is on its piece, and its color.
+#[derive(Clone, Copy)]
+enum Check {
+    /// Sticker `slot` of the corner in position `pos`.
+    Corner {
+        pos: usize,
+        slot: usize,
+        color: u8,
+    },
+    Edge {
+        pos: usize,
+        slot: usize,
+        color: u8,
+    },
+}
+
+impl Check {
+    fn holds(self, c: &Cube) -> bool {
+        match self {
+            Check::Corner { pos, slot, color } => {
+                let (piece, twist) = (c.cp[pos] as usize, c.co[pos] as usize);
+                CORNER_COLORS[piece][(slot + 3 - twist) % 3] == color
+            }
+            Check::Edge { pos, slot, color } => {
+                let (piece, flip) = (c.ep[pos] as usize, c.eo[pos] as usize);
+                EDGE_COLORS[piece][(slot + flip) % 2] == color
+            }
+        }
+    }
+}
+
+/// The painted stickers (centers left out: they never move).
+fn checks(painted: &[u8; 54]) -> Vec<Check> {
+    let mut out = Vec::new();
+    for (pos, stickers) in CORNER_FACELETS.iter().enumerate() {
+        for (slot, &k) in stickers.iter().enumerate() {
+            if painted[k] != ANY {
+                out.push(Check::Corner {
+                    pos,
+                    slot,
+                    color: painted[k],
+                });
+            }
+        }
+    }
+    for (pos, stickers) in EDGE_FACELETS.iter().enumerate() {
+        for (slot, &k) in stickers.iter().enumerate() {
+            if painted[k] != ANY {
+                out.push(Check::Edge {
+                    pos,
+                    slot,
+                    color: painted[k],
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The fewest moves (at most `max_len`) that turn a solved cube into one
+/// that matches `painted`, or `None` if there are none that short or
+/// `keep_going` said stop. Tries every sequence, shortest first, so it is
+/// only quick for short ones: 7 moves take about a second.
+pub fn find_short(
+    painted: &[u8; 54],
+    max_len: usize,
+    keep_going: &dyn Fn() -> bool,
+) -> Option<Vec<Move>> {
+    struct Walk<'a> {
+        checks: Vec<Check>,
+        path: Vec<Move>,
+        keep_going: &'a dyn Fn() -> bool,
+        nodes: u32,
+    }
+    impl Walk<'_> {
+        fn search(&mut self, c: Cube, depth: usize) -> Option<bool> {
+            if depth == 0 {
+                return Some(self.checks.iter().all(|k| k.holds(&c)));
+            }
+            self.nodes = self.nodes.wrapping_add(1);
+            if self.nodes.is_multiple_of(4096) && !(self.keep_going)() {
+                return None;
+            }
+            for m in Move::all() {
+                // never the same face twice, and opposite faces in one order
+                if let Some(last) = self.path.last()
+                    && (m.face == last.face || (m.face % 3 == last.face % 3 && m.face < last.face))
+                {
+                    continue;
+                }
+                self.path.push(m);
+                if self.search(c.apply(m), depth - 1)? {
+                    return Some(true);
+                }
+                self.path.pop();
+            }
+            Some(false)
+        }
+    }
+    let mut walk = Walk {
+        checks: checks(painted),
+        path: Vec::new(),
+        keep_going,
+        nodes: 0,
+    };
+    for depth in 0..=max_len {
+        if walk.search(SOLVED, depth)? {
+            return Some(walk.path);
+        }
+    }
+    None
+}
+
+/// A way to make `state` from a solved cube, found at once (at most 21
+/// moves).
+pub fn first_way(state: &Cube) -> Vec<Move> {
+    let solution = twophase::solve(state, 21).expect("every state has a 21-move solution");
+    solution.iter().rev().map(|m| m.inverse()).collect()
+}
+
+/// Ways to make `state` from a solved cube, each shorter than the last:
+/// the two-phase solver's first answer at once, then shorter ones for as
+/// long as `keep_going` says so. `better` gets each one.
+pub fn shorten(state: &Cube, keep_going: &dyn Fn() -> bool, better: &mut dyn FnMut(&[Move])) {
     let invert = |sol: Vec<Move>| -> Vec<Move> { sol.iter().rev().map(|m| m.inverse()).collect() };
     let mut best = invert(twophase::solve(state, 21).expect("every state has a 21-move solution"));
-    let deadline = Instant::now() + time;
+    better(&best);
     while let Some(len) = best.len().checked_sub(1) {
-        match twophase::solve_until(state, len, deadline) {
-            Some(sol) => best = invert(sol),
+        match twophase::solve_while(state, len, keep_going) {
+            Some(sol) => {
+                best = invert(sol);
+                better(&best);
+            }
             None => break,
         }
     }
+}
+
+/// The shortest way to make `state` that `shorten` finds in `time`.
+#[cfg(test)]
+pub fn moves_to_make(state: &Cube, time: Duration) -> Vec<Move> {
+    let deadline = Instant::now() + time;
+    let mut best = Vec::new();
+    shorten(state, &|| Instant::now() < deadline, &mut |m| {
+        best = m.to_vec()
+    });
     best
 }
 
@@ -791,6 +935,54 @@ mod tests {
         let mut f = solved;
         f[4] = 1;
         assert!(complete(&f).is_err());
+    }
+
+    #[test]
+    fn sticker_checks_agree_with_the_stickers() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        for _ in 0..200 {
+            let a = Cube::random(&mut rng);
+            let b = Cube::random(&mut rng);
+            let painted = a.facelets();
+            assert!(checks(&painted).iter().all(|k| k.holds(&a)));
+            let agree = checks(&painted).iter().all(|k| k.holds(&b));
+            assert_eq!(agree, matches(&b.facelets(), &painted));
+            for (k, check) in checks(&painted).into_iter().enumerate() {
+                let sticker = match check {
+                    Check::Corner { pos, slot, .. } => CORNER_FACELETS[pos][slot],
+                    Check::Edge { pos, slot, .. } => EDGE_FACELETS[pos][slot],
+                };
+                assert_eq!(
+                    check.holds(&b),
+                    b.facelets()[sticker] == painted[sticker],
+                    "check {k}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn short_paintings_get_the_fewest_moves() {
+        // a green X on blue, painted on the front alone: U2 D2 R2 L2
+        let mut f = [ANY; 54];
+        for face in 0..6 {
+            f[face * 9 + 4] = face as u8;
+        }
+        let x = [1, 0, 1, 0, 1, 0, 1, 0, 1];
+        for k in 0..9 {
+            f[18 + k] = if x[k] == 1 { 2 } else { 5 };
+        }
+        let moves = find_short(&f, 6, &|| true).expect("4 moves");
+        assert_eq!(moves.len(), 4);
+        assert!(matches(&SOLVED.apply_all(&moves).facelets(), &f));
+        // nothing that short for a scramble
+        let far = SOLVED
+            .apply_all(&cube::parse("R U F D L B R").unwrap())
+            .facelets();
+        assert_eq!(find_short(&far, 4, &|| true), None);
+        // and it stops when told to
+        assert_eq!(find_short(&far, 7, &|| false), None);
     }
 
     #[test]

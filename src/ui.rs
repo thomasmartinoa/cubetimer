@@ -160,6 +160,7 @@ fn draw_input(frame: &mut Frame, area: Rect, input: &crate::app::TextInput) {
             ("comment", " enter saves, esc cancels, empty clears ")
         }
         crate::app::InputKind::PatternName => ("name your pattern", " enter saves, esc cancels "),
+        crate::app::InputKind::PatternRename(_) => ("rename pattern", " enter saves, esc cancels "),
         crate::app::InputKind::PatternMoves => (
             "moves from solved, white on top, green in front (R U' F2, M, x...)",
             " enter shows the cube, esc cancels ",

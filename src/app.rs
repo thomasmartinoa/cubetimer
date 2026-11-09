@@ -109,6 +109,8 @@ pub enum InputKind {
     PatternName,
     /// Moves to load into the pattern editor.
     PatternMoves,
+    /// A new name for saved pattern `i`.
+    PatternRename(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -684,6 +686,12 @@ impl App {
                     .patterns
                     .push(crate::store::SavedPattern { name, alg });
             }
+            InputKind::PatternRename(i) => {
+                // an empty name keeps the old one
+                if let (Some(name), Some(p)) = (value, self.data.patterns.get_mut(i)) {
+                    p.name = name;
+                }
+            }
             InputKind::PatternMoves => {
                 let Some(browser) = self.patterns.as_mut() else {
                     return;
@@ -892,6 +900,14 @@ impl App {
                     kind: InputKind::PatternMoves,
                     text: String::new(),
                 });
+            }
+            patternview::Action::Rename(i) => {
+                if let Some(p) = self.data.patterns.get(i) {
+                    self.input = Some(TextInput {
+                        kind: InputKind::PatternRename(i),
+                        text: p.name.clone(),
+                    });
+                }
             }
             patternview::Action::Delete(i) => {
                 if i < self.data.patterns.len() {

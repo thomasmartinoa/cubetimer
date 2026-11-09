@@ -9,7 +9,6 @@
 
 use std::collections::VecDeque;
 use std::sync::OnceLock;
-use std::time::Instant;
 
 use crate::cube::{Cube, Move, SOLVED};
 
@@ -141,8 +140,9 @@ struct Search<'a> {
     start: Cube,
     max_len: usize,
     path: Vec<Move>,
-    /// Give up at this time (checked every few thousand nodes).
-    deadline: Option<Instant>,
+    /// Asked every few thousand nodes whether to go on; the search gives
+    /// up once it says no.
+    keep_going: Option<&'a dyn Fn() -> bool>,
     nodes: u32,
     timed_out: bool,
 }
@@ -155,8 +155,8 @@ impl Search<'_> {
         }
         self.nodes = self.nodes.wrapping_add(1);
         if self.nodes.is_multiple_of(4096)
-            && let Some(deadline) = self.deadline
-            && Instant::now() >= deadline
+            && let Some(keep_going) = self.keep_going
+            && !keep_going()
         {
             self.timed_out = true;
         }
@@ -249,13 +249,18 @@ pub fn solve(cube: &Cube, max_len: usize) -> Option<Vec<Move>> {
     search(cube, max_len, None)
 }
 
-/// Like `solve`, but gives up at `deadline`: `None` means there is no
-/// solution that short, or none was found in time.
-pub fn solve_until(cube: &Cube, max_len: usize, deadline: Instant) -> Option<Vec<Move>> {
-    search(cube, max_len, Some(deadline))
+/// Like `solve`, but gives up as soon as `keep_going` says no (it is asked
+/// every few thousand nodes): `None` means there is no solution that short,
+/// or the search was stopped first.
+pub fn solve_while(
+    cube: &Cube,
+    max_len: usize,
+    keep_going: &dyn Fn() -> bool,
+) -> Option<Vec<Move>> {
+    search(cube, max_len, Some(keep_going))
 }
 
-fn search(cube: &Cube, max_len: usize, deadline: Option<Instant>) -> Option<Vec<Move>> {
+fn search(cube: &Cube, max_len: usize, keep_going: Option<&dyn Fn() -> bool>) -> Option<Vec<Move>> {
     debug_assert!(cube.is_solvable());
     let t = tables();
     let mut search = Search {
@@ -263,7 +268,7 @@ fn search(cube: &Cube, max_len: usize, deadline: Option<Instant>) -> Option<Vec<
         start: *cube,
         max_len,
         path: Vec::new(),
-        deadline,
+        keep_going,
         nodes: 0,
         timed_out: false,
     };
