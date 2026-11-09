@@ -140,10 +140,33 @@ struct Search<'a> {
     start: Cube,
     max_len: usize,
     path: Vec<Move>,
+    /// Asked every few thousand nodes whether to go on; the search gives
+    /// up once it says no.
+    keep_going: Option<&'a dyn Fn() -> bool>,
+    nodes: u32,
+    timed_out: bool,
 }
 
 impl Search<'_> {
+    /// Whether the search has run out of time.
+    fn out_of_time(&mut self) -> bool {
+        if self.timed_out {
+            return true;
+        }
+        self.nodes = self.nodes.wrapping_add(1);
+        if self.nodes.is_multiple_of(4096)
+            && let Some(keep_going) = self.keep_going
+            && !keep_going()
+        {
+            self.timed_out = true;
+        }
+        self.timed_out
+    }
+
     fn phase1(&mut self, twist: usize, flip: usize, slice: usize, depth: usize) -> bool {
+        if self.out_of_time() {
+            return false;
+        }
         let t = self.t;
         let h = t.twist_slice[twist * N_SLICE + slice].max(t.flip_slice[flip * N_SLICE + slice])
             as usize;
@@ -186,6 +209,9 @@ impl Search<'_> {
     }
 
     fn phase2(&mut self, cp: usize, ep: usize, sp: usize, depth: usize) -> bool {
+        if self.out_of_time() {
+            return false;
+        }
         let t = self.t;
         let h = t.corner_slice[cp * N_SLICE_PERM + sp].max(t.edge_slice[ep * N_SLICE_PERM + sp])
             as usize;
@@ -220,6 +246,21 @@ impl Search<'_> {
 /// short. Any state has one of at most 20 moves; asking for 20 or more always
 /// succeeds, and the two-phase search finds 21 quickly.
 pub fn solve(cube: &Cube, max_len: usize) -> Option<Vec<Move>> {
+    search(cube, max_len, None)
+}
+
+/// Like `solve`, but gives up as soon as `keep_going` says no (it is asked
+/// every few thousand nodes): `None` means there is no solution that short,
+/// or the search was stopped first.
+pub fn solve_while(
+    cube: &Cube,
+    max_len: usize,
+    keep_going: &dyn Fn() -> bool,
+) -> Option<Vec<Move>> {
+    search(cube, max_len, Some(keep_going))
+}
+
+fn search(cube: &Cube, max_len: usize, keep_going: Option<&dyn Fn() -> bool>) -> Option<Vec<Move>> {
     debug_assert!(cube.is_solvable());
     let t = tables();
     let mut search = Search {
@@ -227,11 +268,17 @@ pub fn solve(cube: &Cube, max_len: usize) -> Option<Vec<Move>> {
         start: *cube,
         max_len,
         path: Vec::new(),
+        keep_going,
+        nodes: 0,
+        timed_out: false,
     };
     let (twist, flip, slice) = (cube.twist(), cube.flip(), cube.slice());
     for depth in 0..=max_len {
         if search.phase1(twist, flip, slice, depth) {
             return Some(search.path);
+        }
+        if search.timed_out {
+            return None;
         }
     }
     None

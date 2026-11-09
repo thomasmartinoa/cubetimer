@@ -15,6 +15,7 @@ use crate::algview::{self, AlgBrowser};
 use crate::chart::Range;
 use crate::fmt::{self, Precision, RunDisplay};
 use crate::font;
+use crate::patternview::{self, PatternBrowser};
 use crate::puzzle::{self, Puzzle};
 use crate::scramble::Scrambler;
 use crate::stats::{self, Penalty, Summary, TimeResult};
@@ -104,6 +105,12 @@ pub enum InputKind {
     SessionName,
     /// The solve (an index into the session) being commented.
     Comment(usize),
+    /// The name of the pattern being saved.
+    PatternName,
+    /// Moves to load into the pattern editor.
+    PatternMoves,
+    /// A new name for saved pattern `i`.
+    PatternRename(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +141,8 @@ pub struct App {
     pub show_help: bool,
     /// The algorithm browser, when open.
     pub algs: Option<AlgBrowser>,
+    /// The patterns screen, when open.
+    pub patterns: Option<PatternBrowser>,
     /// The trainer, while drilling algorithms; scrambles come from it.
     pub drill: Option<Drill>,
     /// The case the current training scramble sets up.
@@ -195,6 +204,7 @@ impl App {
             picker: None,
             stats: None,
             algs: None,
+            patterns: None,
             drill: None,
             drill_case: None,
             last_case: None,
@@ -291,12 +301,18 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         let mut mouse = false;
         while !self.quit {
-            if self.cube_view.is_some() || self.algs.is_some() {
+            if self.cube_view.is_some() || self.algs.is_some() || self.patterns.is_some() {
                 // ask the terminal about images once, before drawing the first image
                 self.gfx.ensure_picker();
             }
-            // the mouse turns the cube; elsewhere the terminal keeps it for selecting text
-            if self.cube_view.is_some() != mouse {
+            // the mouse turns the cube and paints patterns; elsewhere the
+            // terminal keeps it for selecting text
+            let wants_mouse = self.cube_view.is_some()
+                || self
+                    .patterns
+                    .as_ref()
+                    .is_some_and(|p| p.tab == patternview::Tab::Create);
+            if wants_mouse != mouse {
                 mouse = !mouse;
                 crate::term::set_mouse(mouse)?;
             }
@@ -328,6 +344,9 @@ impl App {
         if self.cube_view.as_ref().is_some_and(CubeView::animating) {
             return Some(Duration::from_millis(30));
         }
+        if self.patterns.as_ref().is_some_and(|p| p.editor.working()) {
+            return Some(Duration::from_millis(50));
+        }
         match self.state {
             State::Idle if self.pb_flash.is_some() || self.scramble.is_empty() => {
                 Some(Duration::from_millis(50))
@@ -346,6 +365,10 @@ impl App {
             Event::Mouse(m) => {
                 if let Some(view) = self.cube_view.as_mut() {
                     view.mouse(m.kind, m.column, m.row);
+                } else if let Some(patterns) = self.patterns.as_mut()
+                    && self.input.is_none()
+                {
+                    patterns.mouse(m.kind, m.column, m.row);
                 }
             }
             _ => {}
@@ -389,6 +412,12 @@ impl App {
             if let Some(browser) = self.algs.as_mut() {
                 if AlgBrowser::repeats(code) {
                     browser.key(code);
+                }
+                return;
+            }
+            if let Some(browser) = self.patterns.as_mut() {
+                if self.input.is_none() && PatternBrowser::repeats(code) {
+                    browser.key(code, &self.data.patterns);
                 }
                 return;
             }
@@ -470,6 +499,10 @@ impl App {
             self.algs_key(code);
             return;
         }
+        if self.patterns.is_some() {
+            self.patterns_key(code);
+            return;
+        }
         if let Some(selected) = self.picker {
             self.picker_key(code, selected);
             return;
@@ -513,6 +546,7 @@ impl App {
             KeyCode::Char('v') if idle => self.open_cube_view(None),
             KeyCode::Char('s') if idle => self.stats = Some(StatsView::new(self)),
             KeyCode::Char('a') if idle => self.algs = Some(AlgBrowser::default()),
+            KeyCode::Char('c') if idle => self.patterns = Some(PatternBrowser::default()),
             KeyCode::Char('n') if idle => self.new_session(),
             KeyCode::Char('X') if idle => self.confirm_session_delete = true,
             KeyCode::Char('[') if idle => self.switch_session(-1),
@@ -630,13 +664,46 @@ impl App {
             return;
         };
         let text = input.text.trim().to_string();
-        let value = (!text.is_empty()).then_some(text);
+        let value = (!text.is_empty()).then(|| text.clone());
         match input.kind {
             InputKind::SessionName => self.data.sessions[self.data.current].name = value,
             InputKind::Comment(i) => {
                 if let Some(solve) = self.data.solves_mut().get_mut(i) {
                     solve.comment = value;
                 }
+            }
+            InputKind::PatternName => {
+                let Some(browser) = self.patterns.as_mut() else {
+                    return;
+                };
+                let Some(alg) = browser.editor.alg() else {
+                    return;
+                };
+                let name =
+                    value.unwrap_or_else(|| format!("pattern {}", self.data.patterns.len() + 1));
+                browser.note = Some(format!("saved {name} in mine"));
+                self.data
+                    .patterns
+                    .push(crate::store::SavedPattern { name, alg });
+            }
+            InputKind::PatternRename(i) => {
+                // an empty name keeps the old one
+                if let (Some(name), Some(p)) = (value, self.data.patterns.get_mut(i)) {
+                    p.name = name;
+                }
+            }
+            InputKind::PatternMoves => {
+                let Some(browser) = self.patterns.as_mut() else {
+                    return;
+                };
+                match crate::alg::effect(&text) {
+                    Some(state) if !text.is_empty() => {
+                        browser.editor.load(state.facelets());
+                        browser.note = Some(format!("the cube after {text}"));
+                    }
+                    _ => browser.note = Some(format!("can't read those moves: {text}")),
+                }
+                return;
             }
         }
         self.persist();
@@ -805,6 +872,54 @@ impl App {
         }
     }
 
+    /// Keys while the patterns screen is open.
+    fn patterns_key(&mut self, code: KeyCode) {
+        let Some(browser) = self.patterns.as_mut() else {
+            return;
+        };
+        match browser.key(code, &self.data.patterns) {
+            patternview::Action::None => {}
+            patternview::Action::Close => self.patterns = None,
+            patternview::Action::Play { title, alg } => {
+                let steps = crate::alg::steps(&alg).unwrap_or_default();
+                let view = CubeView::for_steps(title, crate::nxn::Nxn::solved(3), steps);
+                self.show_cube_view(view);
+            }
+            patternview::Action::Copy(text) => {
+                browser.note = Some(format!("copied: {}", ellipsis(&text, 60)));
+                self.pending_copy = Some(text);
+            }
+            patternview::Action::Save => {
+                self.input = Some(TextInput {
+                    kind: InputKind::PatternName,
+                    text: String::new(),
+                });
+            }
+            patternview::Action::AskMoves => {
+                self.input = Some(TextInput {
+                    kind: InputKind::PatternMoves,
+                    text: String::new(),
+                });
+            }
+            patternview::Action::Rename(i) => {
+                if let Some(p) = self.data.patterns.get(i) {
+                    self.input = Some(TextInput {
+                        kind: InputKind::PatternRename(i),
+                        text: p.name.clone(),
+                    });
+                }
+            }
+            patternview::Action::Delete(i) => {
+                if i < self.data.patterns.len() {
+                    let gone = self.data.patterns.remove(i);
+                    browser.note = Some(format!("deleted {}", gone.name));
+                    browser.clamp(self.data.patterns.len());
+                    self.persist();
+                }
+            }
+        }
+    }
+
     /// Keys on the statistics screen.
     fn stats_key(&mut self, code: KeyCode) {
         let Some(view) = self.stats.as_mut() else {
@@ -955,6 +1070,9 @@ impl App {
     pub fn tick(&mut self, now: Instant) {
         if let Some(view) = self.cube_view.as_mut() {
             view.tick(now);
+        }
+        if let Some(browser) = self.patterns.as_mut() {
+            browser.editor.poll();
         }
         // Only between solves: a scramble (and training case) that arrives
         // during an attempt started without one isn't what is being solved,

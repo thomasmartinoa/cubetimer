@@ -13,6 +13,7 @@ use crate::app::{App, Tone};
 use crate::fmt;
 use crate::font;
 use crate::nxn;
+use crate::patternview;
 use crate::stats::{Penalty, Summary, TimeResult};
 use crate::statsview;
 use crate::view3d;
@@ -43,6 +44,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if let Some(browser) = &app.algs {
         algview::draw(frame, area, browser, &app.data, app.look, &app.gfx);
+        return;
+    }
+    if let Some(browser) = &app.patterns {
+        patternview::draw(frame, area, browser, &app.data, app.look, &app.gfx);
+        if let Some(input) = &app.input {
+            draw_input(frame, area, input);
+        }
         return;
     }
     if let Some(view) = &app.stats {
@@ -144,17 +152,27 @@ fn draw_settings(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
 
 /// The line being typed (a session name or a comment), along the bottom.
 fn draw_input(frame: &mut Frame, area: Rect, input: &crate::app::TextInput) {
-    let label = match input.kind {
-        crate::app::InputKind::SessionName => "session name",
-        crate::app::InputKind::Comment(_) => "comment",
+    let (label, hint) = match input.kind {
+        crate::app::InputKind::SessionName => {
+            ("session name", " enter saves, esc cancels, empty clears ")
+        }
+        crate::app::InputKind::Comment(_) => {
+            ("comment", " enter saves, esc cancels, empty clears ")
+        }
+        crate::app::InputKind::PatternName => ("name your pattern", " enter saves, esc cancels "),
+        crate::app::InputKind::PatternRename(_) => ("rename pattern", " enter saves, esc cancels "),
+        crate::app::InputKind::PatternMoves => (
+            "moves from solved, white on top, green in front (R U' F2, M, x...)",
+            " enter shows the cube, esc cancels ",
+        ),
     };
     let [_, line] = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(area);
     frame.render_widget(Clear, line);
     frame.render_widget(
         Paragraph::new(format!("{}\u{2588}", input.text)).block(
-            Block::bordered().title(format!(" {label} ")).title_bottom(
-                Line::from(" enter saves, esc cancels, empty clears ").right_aligned(),
-            ),
+            Block::bordered()
+                .title(format!(" {label} "))
+                .title_bottom(Line::from(hint).right_aligned()),
         ),
         line,
     );
@@ -656,7 +674,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Every key, for the `?` overlay.
-const HELP: [(&str, &str); 27] = [
+const HELP: [(&str, &str); 28] = [
     ("space", "inspect, hold and release to start, stop"),
     ("any key", "stop a running solve"),
     ("esc", "cancel inspection or a hold"),
@@ -665,13 +683,14 @@ const HELP: [(&str, &str); 27] = [
     ("h", "history: browse, mark and delete any solve"),
     ("s", "statistics: chart, distribution, summary"),
     ("a", "algorithms: PLL, OLL, F2L, with the 3D cube"),
+    ("c", "patterns: famous ones, letters, paint your own"),
     (",", "settings: hold time, precision, bell, font, 3D look"),
     ("r", "name the current session"),
     (
         "y",
         "copy the scramble (in history: the solve; in stats: ao5, Y ao12)",
     ),
-    ("c", "in history: comment the selected solve"),
+    ("c", "(in history) comment the selected solve"),
     ("e", "choose the puzzle: 2x2 to 7x7"),
     ("v", "the scrambled cube in 3D: turn it, watch the scramble"),
     ("n", "new session"),
