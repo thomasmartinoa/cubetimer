@@ -293,7 +293,7 @@ pub const EDGE_FACELETS: [[usize; 2]; 12] = [
     [48, 14],
 ];
 /// The face colors of each corner and edge piece, in the same sticker order.
-const CORNER_COLORS: [[u8; 3]; 8] = [
+pub const CORNER_COLORS: [[u8; 3]; 8] = [
     [0, 1, 2],
     [0, 2, 4],
     [0, 4, 5],
@@ -303,7 +303,7 @@ const CORNER_COLORS: [[u8; 3]; 8] = [
     [3, 5, 4],
     [3, 1, 5],
 ];
-const EDGE_COLORS: [[u8; 2]; 12] = [
+pub const EDGE_COLORS: [[u8; 2]; 12] = [
     [0, 1],
     [0, 2],
     [0, 4],

@@ -9,6 +9,8 @@ mod fmt;
 mod font;
 mod import;
 mod nxn;
+mod patterns;
+mod patternview;
 mod puzzle;
 mod render3d;
 mod scramble;

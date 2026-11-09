@@ -135,6 +135,17 @@ pub struct Data {
     /// "learning"). Cases you haven't marked aren't listed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub progress: BTreeMap<String, String>,
+    /// Cube patterns you made, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<SavedPattern>,
+}
+
+/// A pattern you made: its name and the moves that make it from solved
+/// (white on top, green in front). The picture comes from the moves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedPattern {
+    pub name: String,
+    pub alg: String,
 }
 
 impl Default for Data {
@@ -144,6 +155,7 @@ impl Default for Data {
             current: 0,
             settings: Settings::default(),
             progress: BTreeMap::new(),
+            patterns: Vec::new(),
         }
     }
 }

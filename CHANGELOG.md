@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Cube patterns (`c`): 32 famous patterns (checkerboard, cube in a cube, superflip, snakes,
+  crosses, ...) and 21 letters, hearts and words (`I ♥ U`, `HI`), each with the moves that
+  make it, a picture, and playback on the 3D cube. Every algorithm is checked by the tests,
+  and the letters against the shape they should show.
+- Paint your own pattern (`c`, then `tab` to create): color the stickers you care about
+  with the keys or the mouse, leave the rest open, and cubetimer fills in a real cube and
+  finds a short way to make it (at most 21 moves). If no real cube looks like your
+  painting, it says why: too many stickers of a color, a piece that doesn't exist, a
+  twisted corner, a flipped edge or two swapped pieces. Save your patterns to keep them.
 - Fixed a crash when a solve's scramble has a move too wide for its cube (`4Rw` on a 3x3,
   from an imported or hand-edited file): the preview and the 3D view now skip it.
 - Fixed a solve started before its scramble was ready being saved with the next scramble

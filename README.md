@@ -38,6 +38,12 @@ marked, a histogram, and a full summary down to ao1000.
 
 ![the statistics screen: time chart, distribution and summary](docs/screenshots/stats.png)
 
+**Cube patterns.** Press `c` for famous patterns (checkerboard, cube in a cube, superflip,
+snakes and more) and letters, hearts and words like `I ♥ U`, each with the moves that make
+it from a solved cube and the 3D cube to follow along. Or paint your own: color the
+stickers you want, leave the rest open, and cubetimer works out a real cube and the moves
+for it, or tells you why no real cube looks like that.
+
 And: sessions per puzzle with names, a history of every solve you can comment on, mark or
 delete, a settings screen (hold time, precision and more), copying scrambles and averages to
 the clipboard, CSV export, and import from csTimer.
@@ -72,6 +78,7 @@ Press `?` in the timer for every key. The ones you need first:
 | `s` | statistics |
 | `v` | the scramble in 3D (`m` changes how it is drawn) |
 | `a` | algorithms and the trainer |
+| `c` | cube patterns, and paint your own |
 | `e` | choose the puzzle, 2x2 to 7x7 |
 | `n` `[` `]` | new session, previous, next |
 | `,` | settings |
