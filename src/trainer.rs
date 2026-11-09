@@ -175,7 +175,9 @@ pub fn case_times(solves: &[Solve], key: &str) -> CaseTimes {
         .count();
     CaseTimes {
         count,
-        mean: (!times.is_empty()).then(|| times.iter().sum::<u64>() / times.len() as u64),
+        mean: (!times.is_empty()).then(|| {
+            crate::stats::floor_mean(times.iter().map(|&t| u128::from(t)).sum(), times.len())
+        }),
         best: times.iter().copied().min(),
     }
 }

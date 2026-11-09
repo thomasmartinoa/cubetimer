@@ -86,33 +86,35 @@ fn import(path: &str, dry_run: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (sessions, summary) = match import::parse(&text) {
+    let (sessions, mut summary) = match import::parse(&text) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("cubetimer: {path}: {e}");
             return ExitCode::FAILURE;
         }
     };
-    println!("{}", summary.describe(dry_run));
-    if dry_run || sessions.is_empty() {
-        return ExitCode::SUCCESS;
-    }
     let Some(data_path) = store::default_path() else {
         eprintln!("cubetimer: no data directory");
         return ExitCode::FAILURE;
     };
-    // writing your data: not while the timer is running
-    let _lock = match store::lock(&data_path) {
-        Ok(Some(lock)) => lock,
-        Ok(None) => {
-            eprintln!("cubetimer: the timer is running; close it first, then import");
-            return ExitCode::FAILURE;
-        }
-        Err(e) => {
-            eprintln!("cubetimer: can't lock {}: {e}", data_path.display());
-            return ExitCode::FAILURE;
+    // Writing your data: not while the timer is running. A dry run only
+    // reads, which needs no lock (saves replace the file atomically).
+    let _lock = if dry_run {
+        None
+    } else {
+        match store::lock(&data_path) {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                eprintln!("cubetimer: the timer is running; close it first, then import");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("cubetimer: can't lock {}: {e}", data_path.display());
+                return ExitCode::FAILURE;
+            }
         }
     };
+    // read your solves first, so solves you already have are left out
     let mut data = match store::read(&data_path) {
         Ok(d) => d,
         Err(e) => {
@@ -120,7 +122,11 @@ fn import(path: &str, dry_run: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    import::merge(&mut data, sessions);
+    import::merge(&mut data, sessions, &mut summary);
+    println!("{}", summary.describe(dry_run));
+    if dry_run || summary.solves == 0 {
+        return ExitCode::SUCCESS;
+    }
     match store::save(&data_path, &data) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

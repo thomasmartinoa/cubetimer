@@ -9,8 +9,7 @@ pub enum Precision {
     /// Hundredths (`12.34`), the WCA default.
     #[default]
     Centi,
-    /// Thousandths (`12.345`). Not user-selectable yet.
-    #[allow(dead_code)]
+    /// Thousandths (`12.345`), a setting.
     Milli,
 }
 
@@ -96,7 +95,7 @@ pub fn fmt_avg_ms(ms: u64, prec: Precision) -> String {
 pub fn fmt_solve(raw_ms: u64, penalty: Penalty, prec: Precision) -> String {
     match penalty {
         Penalty::Ok => fmt_time(raw_ms, prec),
-        Penalty::Plus2 => format!("{}+", fmt_time(raw_ms + 2000, prec)),
+        Penalty::Plus2 => format!("{}+", fmt_time(raw_ms.saturating_add(2000), prec)),
         Penalty::Dnf => "DNF".into(),
     }
 }

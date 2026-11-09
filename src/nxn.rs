@@ -84,6 +84,13 @@ pub fn parse(seq: &str) -> Option<Vec<Move>> {
     seq.split_whitespace().map(parse_move).collect()
 }
 
+/// Parse `seq` as moves on a cube of `size`: like `parse`, but `None` if a
+/// move turns more layers than the cube has (`4Rw` on a 3x3), which `apply`
+/// can't do. Use it for scrambles read from a file.
+pub fn parse_for(seq: &str, size: usize) -> Option<Vec<Move>> {
+    parse(seq).filter(|moves| moves.iter().all(|m| m.layers as usize <= size))
+}
+
 fn parse_move(tok: &str) -> Option<Move> {
     let (turns, body) = if let Some(b) = tok.strip_suffix('\'') {
         (3, b)
@@ -376,6 +383,20 @@ mod tests {
             "X", "R3", "Rww", "1Rw", "2Rw", "3R", "Rw3", "w", "R2'", "U ' ",
         ] {
             assert!(parse(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn parse_for_rejects_moves_too_wide_for_the_cube() {
+        assert!(parse_for("R 3Rw", 3).is_some(), "3Rw on a 3x3 turns it all");
+        assert!(parse_for("R 4Rw", 3).is_none());
+        assert!(parse_for("Rw", 2).is_some());
+        assert!(parse_for("3Rw", 2).is_none());
+        assert!(parse_for("255Uw'", 7).is_none());
+        assert_eq!(parse_for("", 3), Some(vec![]));
+        // whatever parse_for accepts, apply can do
+        for (seq, n) in [("R 3Rw", 3), ("Rw", 2), ("3Fw2 Uw", 7)] {
+            Nxn::solved(n).apply_all(&parse_for(seq, n).unwrap());
         }
     }
 

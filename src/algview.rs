@@ -23,7 +23,7 @@ use crate::nxn::Nxn;
 use crate::render3d::{Camera, GRAY};
 use crate::store::{Data, Solve};
 use crate::trainer;
-use crate::ui::STICKER_COLORS;
+use crate::ui::{STICKER_COLORS, dim};
 use crate::view3d::{self, Gfx, Look};
 
 /// The color each face's stickers are shown in: the model's white-top
@@ -278,10 +278,6 @@ pub fn diagram(case: &Case) -> Vec<Line<'static>> {
 
 /// The width of a diagram, in columns.
 pub const DIAGRAM_WIDTH: u16 = LL_PIXELS as u16;
-
-fn dim() -> Style {
-    Style::new().fg(Color::DarkGray)
-}
 
 /// The tile size: the diagram, its name and its progress mark.
 fn tile_size(set: Set) -> (u16, u16) {

@@ -11,7 +11,7 @@ use std::time::Instant;
 use image::{DynamicImage, RgbaImage};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, MouseButton, MouseEventKind};
-use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
@@ -24,7 +24,7 @@ use ratatui_image::protocol::{StatefulProtocol, StatefulProtocolType};
 use crate::anim::{Player, Step};
 use crate::nxn::{self, Nxn};
 use crate::render3d::{self, Camera, Turning};
-use crate::ui;
+use crate::ui::{self, dim};
 
 /// How much one arrow press turns the cube.
 const TURN_DEGREES: f64 = 15.0;
@@ -106,7 +106,7 @@ impl CubeView {
     /// A view of `scramble` on a cube of `size`. `None` if the scramble can't
     /// be read (an empty one shows a solved cube).
     pub fn new(title: impl Into<String>, size: usize, scramble: &str) -> Option<CubeView> {
-        let moves = nxn::parse(scramble)?;
+        let moves = nxn::parse_for(scramble, size)?;
         Some(CubeView {
             title: title.into(),
             player: Player::new(size, moves),
@@ -369,10 +369,6 @@ fn parse_cell_size(reply: &[u8]) -> Option<FontSize> {
     (h > 0 && w > 0).then(|| FontSize::new(w, h))
 }
 
-fn dim() -> Style {
-    Style::new().fg(Color::DarkGray)
-}
-
 /// The full-screen cube view.
 pub fn draw(frame: &mut Frame, area: Rect, view: &CubeView, gfx: &Gfx) {
     frame.render_widget(Clear, area);
@@ -466,12 +462,7 @@ fn square_rect(area: Rect, cell_w: usize, cell_h: usize, max: usize) -> (Rect, u
         .min(max.max(cell_w.max(cell_h)));
     let cols = (side / cell_w).max(1) as u16;
     let rows = (side / cell_h).max(1) as u16;
-    let [r] = Layout::horizontal([Constraint::Length(cols)])
-        .flex(Flex::Center)
-        .areas(area);
-    let [r] = Layout::vertical([Constraint::Length(rows)])
-        .flex(Flex::Center)
-        .areas(r);
+    let r = ui::centered(area, cols, rows);
     (r, r.width as usize * cell_w, r.height as usize * cell_h)
 }
 
@@ -732,12 +723,7 @@ fn draw_net(frame: &mut Frame, area: Rect, cube: &Nxn) {
     let lines = ui::net_lines(&grid, scale);
     let height = (lines.len() as u16).min(area.height);
     let width = ((cols * scale) as u16).min(area.width);
-    let [r] = Layout::horizontal([Constraint::Length(width)])
-        .flex(Flex::Center)
-        .areas(area);
-    let [r] = Layout::vertical([Constraint::Length(height)])
-        .flex(Flex::Center)
-        .areas(r);
+    let r = ui::centered(area, width, height);
     frame.render_widget(Paragraph::new(lines), r);
 }
 

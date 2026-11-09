@@ -6,6 +6,12 @@
 //! penalty. Which puzzle a session is comes from `properties.sessionData`
 //! (a JSON string) under `opt.scrType`. Anything missing is tolerated: a
 //! solve needs only its time.
+//!
+//! The file comes from elsewhere, so its text is cleaned of control
+//! characters: an escape sequence in a comment or scramble type would
+//! otherwise reach the terminal through `--import`'s summary or `--export`.
+
+use std::collections::HashSet;
 
 use serde_json::Value;
 
@@ -23,6 +29,14 @@ pub struct Summary {
     pub skipped: Vec<(String, usize)>,
     /// Solves that couldn't be read.
     pub bad_solves: usize,
+    /// Solves left out because they are already in your sessions (the same
+    /// file imported twice).
+    pub duplicates: usize,
+}
+
+/// `text` without control characters (escape sequences, newlines, ...).
+fn clean(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// The puzzle for a csTimer scramble type (`333`, `333oh`, `444wca`, ...).
@@ -58,12 +72,12 @@ fn parse_solve(v: &Value) -> Option<Solve> {
     let text = |i: usize| {
         v.get(i)
             .and_then(Value::as_str)
-            .map(str::trim)
+            .map(|s| clean(s).trim().to_string())
             .filter(|s| !s.is_empty())
     };
-    let mut solve = Solve::new(ms, penalty, text(1).unwrap_or_default().to_string());
+    let mut solve = Solve::new(ms, penalty, text(1).unwrap_or_default());
     solve.ts = v.get(3).and_then(Value::as_u64).unwrap_or(0);
-    solve.comment = text(2).map(String::from);
+    solve.comment = text(2);
     Some(solve)
 }
 
@@ -96,7 +110,7 @@ pub fn parse(text: &str) -> Result<(Vec<Session>, Summary), String> {
             .unwrap_or("333");
         let Some(puzzle) = puzzle_for(scr_type) else {
             if !list.is_empty() {
-                summary.skipped.push((scr_type.to_string(), list.len()));
+                summary.skipped.push((clean(scr_type), list.len()));
             }
             continue;
         };
@@ -105,9 +119,8 @@ pub fn parse(text: &str) -> Result<(Vec<Session>, Summary), String> {
         session.name = meta
             .get("name")
             .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && s.parse::<u32>().is_err())
-            .map(String::from);
+            .map(|s| clean(s).trim().to_string())
+            .filter(|s| !s.is_empty() && s.parse::<u32>().is_err());
         for v in list {
             match parse_solve(v) {
                 Some(s) => session.solves.push(s),
@@ -124,9 +137,35 @@ pub fn parse(text: &str) -> Result<(Vec<Session>, Summary), String> {
     Ok((sessions, summary))
 }
 
-/// Add imported sessions to `data` (after the existing ones).
-pub fn merge(data: &mut Data, sessions: Vec<Session>) {
-    data.sessions.extend(sessions);
+/// Add imported sessions to `data` (after the existing ones), leaving out
+/// solves it already has, so importing the same file twice adds nothing the
+/// second time. A solve is the same if its time, scramble and timestamp are
+/// (penalties may have been changed since); solves without a timestamp are
+/// always added. `summary` is updated to what was actually added.
+pub fn merge(data: &mut Data, sessions: Vec<Session>, summary: &mut Summary) {
+    let key = |s: &Solve| (s.ts, s.ms, s.scramble.clone());
+    let have: HashSet<_> = data
+        .sessions
+        .iter()
+        .flat_map(|s| &s.solves)
+        .filter(|s| s.ts != 0)
+        .map(key)
+        .collect();
+    let (mut added, mut solves) = (0, 0);
+    for mut session in sessions {
+        let before = session.solves.len();
+        session
+            .solves
+            .retain(|s| s.ts == 0 || !have.contains(&key(s)));
+        summary.duplicates += before - session.solves.len();
+        if !session.solves.is_empty() {
+            added += 1;
+            solves += session.solves.len();
+            data.sessions.push(session);
+        }
+    }
+    summary.sessions = added;
+    summary.solves = solves;
 }
 
 impl Summary {
@@ -143,6 +182,12 @@ impl Summary {
             out += &format!(
                 "\nskipped {} solves that could not be read",
                 self.bad_solves
+            );
+        }
+        if self.duplicates > 0 {
+            out += &format!(
+                "\nskipped {} solves that are already in your sessions",
+                self.duplicates
             );
         }
         out
@@ -252,8 +297,8 @@ mod tests {
         let mut data = Data::default();
         data.solves_mut()
             .push(Solve::new(9_000, Penalty::Ok, "R".into()));
-        let (sessions, summary) = parse(EXPORT).unwrap();
-        merge(&mut data, sessions);
+        let (sessions, mut summary) = parse(EXPORT).unwrap();
+        merge(&mut data, sessions, &mut summary);
         assert_eq!(data.sessions.len(), 3);
         assert_eq!(
             data.sessions[0].solves[0].ms, 9_000,
@@ -274,5 +319,60 @@ mod tests {
             crate::store::to_csv(&data).contains("1.800,")
                 || crate::store::to_csv(&data).contains("17.000")
         );
+    }
+
+    #[test]
+    fn importing_the_same_file_twice_adds_nothing_the_second_time() {
+        let mut data = Data::default();
+        let (sessions, mut first) = parse(EXPORT).unwrap();
+        merge(&mut data, sessions, &mut first);
+        assert_eq!((first.sessions, first.solves, first.duplicates), (2, 4, 0));
+        let count = data.sessions.len();
+        let (sessions, mut again) = parse(EXPORT).unwrap();
+        merge(&mut data, sessions, &mut again);
+        assert_eq!(data.sessions.len(), count, "no new (empty) sessions");
+        assert_eq!((again.sessions, again.solves, again.duplicates), (0, 0, 4));
+        assert!(
+            again
+                .describe(false)
+                .contains("skipped 4 solves that are already in your sessions")
+        );
+        // a new solve in an export you had imported before still comes in
+        let more = EXPORT.replace(
+            r#""session2": [["#,
+            r#""session2": [[[0, 41000], "Uw", "", 1700001500], ["#,
+        );
+        let (sessions, mut third) = parse(&more).unwrap();
+        merge(&mut data, sessions, &mut third);
+        assert_eq!((third.sessions, third.solves, third.duplicates), (1, 1, 4));
+        assert_eq!(data.sessions.last().unwrap().solves[0].ms, 41_000);
+    }
+
+    #[test]
+    fn solves_without_a_timestamp_are_never_taken_for_duplicates() {
+        let text = r#"{"session1": [[[0, 1000]], [[0, 1000]]]}"#;
+        let mut data = Data::default();
+        for _ in 0..2 {
+            let (sessions, mut summary) = parse(text).unwrap();
+            merge(&mut data, sessions, &mut summary);
+            assert_eq!((summary.solves, summary.duplicates), (2, 0));
+        }
+    }
+
+    #[test]
+    fn control_characters_in_the_file_never_reach_the_terminal() {
+        // an escape sequence would be printed by --import or --export
+        let text = r#"{
+          "session1": [[[0, 1000], "R\u001b[2J U", "a\u001b]52;c;eA==\u0007b\nc", 1]],
+          "session2": [[[0, 1000], "R", "", 2]],
+          "properties": {"sessionData": "{\"1\":{\"name\":\"x\\u001b[31my\"},\"2\":{\"opt\":{\"scrType\":\"py\\u001b[2Jr\"}}}"}
+        }"#;
+        let (sessions, summary) = parse(text).unwrap();
+        let s = &sessions[0];
+        assert_eq!(s.solves[0].scramble, "R[2J U");
+        assert_eq!(s.solves[0].comment.as_deref(), Some("a]52;c;eA==bc"));
+        assert_eq!(s.name.as_deref(), Some("x[31my"));
+        assert_eq!(summary.skipped, [("py[2Jr".to_string(), 1)]);
+        assert!(!summary.describe(false).contains('\u{1b}'));
     }
 }

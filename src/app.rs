@@ -76,10 +76,11 @@ pub struct View {
     pub hint: String,
 }
 
-/// The key as typed. With the kitty keyboard protocol a shifted key arrives
-/// as its unshifted key plus SHIFT (Shift+/ is '/' with SHIFT, never '?'), so
-/// map letters to capitals and the two symbols cubetimer uses. Other layouts
-/// may put `?` and `+` elsewhere; F1 and `=` work everywhere.
+/// The key as typed. cubetimer asks kitty-protocol terminals for the shifted
+/// character (Shift+/ is '?'), but one that ignores that request sends the
+/// unshifted key plus SHIFT; for those, map letters to capitals and the two
+/// symbols the keys use. Other layouts may put `?` and `+` elsewhere; F1 and
+/// `=` work everywhere.
 fn typed(key: KeyEvent) -> KeyCode {
     match key.code {
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::SHIFT) => KeyCode::Char(match c {
@@ -447,7 +448,16 @@ impl App {
                 KeyCode::Backspace => {
                     input.text.pop();
                 }
-                KeyCode::Char(c) if input.text.chars().count() < MAX_TEXT => input.text.push(c),
+                // Ctrl and Alt chords are commands, not text
+                KeyCode::Char(c)
+                    if !c.is_control()
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && input.text.chars().count() < MAX_TEXT =>
+                {
+                    input.text.push(c)
+                }
                 _ => {}
             }
             return;
@@ -456,64 +466,16 @@ impl App {
             self.settings_key(code, row);
             return;
         }
-        if let Some(browser) = self.algs.as_mut() {
-            match browser.key(code) {
-                algview::Action::None => {}
-                algview::Action::Close => self.algs = None,
-                algview::Action::Train(set) => {
-                    self.algs = None;
-                    self.start_drill(set);
-                }
-                algview::Action::Show(case) => {
-                    let steps = crate::alg::steps(case.alg).unwrap_or_default();
-                    let title = format!("{}   {}", case.title(), case.alg);
-                    self.gfx.ensure_picker();
-                    let mut view = CubeView::for_steps(title, algview::start_cube(case), steps);
-                    view.has_images = self.gfx.has_images();
-                    view.look = match self.look {
-                        Look::Image if !view.has_images => Look::Blocks,
-                        look => look,
-                    };
-                    self.cube_view = Some(view);
-                }
-                algview::Action::Mark(case) => {
-                    let key = case.key();
-                    let now = self
-                        .data
-                        .progress
-                        .get(&key)
-                        .map_or(algview::Progress::New, |s| algview::Progress::from_name(s));
-                    match now.next() {
-                        algview::Progress::New => self.data.progress.remove(&key),
-                        next => self.data.progress.insert(key, next.name().into()),
-                    };
-                    self.persist();
-                }
-            }
+        if self.algs.is_some() {
+            self.algs_key(code);
             return;
         }
         if let Some(selected) = self.picker {
             self.picker_key(code, selected);
             return;
         }
-        if let Some(view) = self.stats.as_mut() {
-            match code {
-                KeyCode::Char('r') => view.range = view.range.next(),
-                KeyCode::Char(c @ '1'..='4') => {
-                    view.range = Range::ALL[c.to_digit(10).unwrap_or(1) as usize - 1];
-                }
-                // y copies the last ao5 written out, Y the last ao12
-                KeyCode::Char(c @ ('y' | 'Y')) => {
-                    let n = if c == 'y' { 5 } else { 12 };
-                    let text = stats::ao_details(&self.results(), n, self.precision);
-                    match text {
-                        Some(t) => self.copy(t),
-                        None => self.status = Some(format!("not enough solves for an ao{n}")),
-                    }
-                }
-                KeyCode::Esc | KeyCode::Char('s' | 'q') => self.stats = None,
-                _ => {}
-            }
+        if self.stats.is_some() {
+            self.stats_key(code);
             return;
         }
         if let Some(selected) = self.history {
@@ -791,19 +753,79 @@ impl App {
             ),
             None => (format!("{name} scramble"), self.scramble.clone()),
         };
-        // find out what the terminal can show before choosing how to start
+        if let Some(view) = CubeView::new(title, size, &scramble) {
+            self.show_cube_view(view);
+        }
+    }
+
+    /// Open `view` in the saved look, once it is known what the terminal can
+    /// show. "image" on a terminal without images is half blocks; start
+    /// there so the first `m` changes what is drawn.
+    fn show_cube_view(&mut self, mut view: CubeView) {
         self.gfx.ensure_picker();
-        let has_images = self.gfx.has_images();
-        self.cube_view = CubeView::new(title, size, &scramble).map(|mut v| {
-            v.has_images = has_images;
-            // "image" on a terminal without images is half blocks; start there
-            // so the first `m` changes what is drawn
-            v.look = match self.look {
-                Look::Image if !has_images => Look::Blocks,
-                look => look,
-            };
-            v
-        });
+        view.has_images = self.gfx.has_images();
+        view.look = match self.look {
+            Look::Image if !view.has_images => Look::Blocks,
+            look => look,
+        };
+        self.cube_view = Some(view);
+    }
+
+    /// Keys while the algorithm browser is open.
+    fn algs_key(&mut self, code: KeyCode) {
+        let Some(browser) = self.algs.as_mut() else {
+            return;
+        };
+        match browser.key(code) {
+            algview::Action::None => {}
+            algview::Action::Close => self.algs = None,
+            algview::Action::Train(set) => {
+                self.algs = None;
+                self.start_drill(set);
+            }
+            algview::Action::Show(case) => {
+                let steps = crate::alg::steps(case.alg).unwrap_or_default();
+                let title = format!("{}   {}", case.title(), case.alg);
+                let view = CubeView::for_steps(title, algview::start_cube(case), steps);
+                self.show_cube_view(view);
+            }
+            algview::Action::Mark(case) => {
+                let key = case.key();
+                let now = self
+                    .data
+                    .progress
+                    .get(&key)
+                    .map_or(algview::Progress::New, |s| algview::Progress::from_name(s));
+                match now.next() {
+                    algview::Progress::New => self.data.progress.remove(&key),
+                    next => self.data.progress.insert(key, next.name().into()),
+                };
+                self.persist();
+            }
+        }
+    }
+
+    /// Keys on the statistics screen.
+    fn stats_key(&mut self, code: KeyCode) {
+        let Some(view) = self.stats.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Char('r') => view.range = view.range.next(),
+            KeyCode::Char(c @ '1'..='4') => {
+                view.range = Range::ALL[c.to_digit(10).unwrap_or(1) as usize - 1];
+            }
+            // y copies the last ao5 written out, Y the last ao12
+            KeyCode::Char(c @ ('y' | 'Y')) => {
+                let n = if c == 'y' { 5 } else { 12 };
+                match stats::ao_details(&self.results(), n, self.precision) {
+                    Some(t) => self.copy(t),
+                    None => self.status = Some(format!("not enough solves for an ao{n}")),
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('s' | 'q') => self.stats = None,
+            _ => {}
+        }
     }
 
     /// Keys while the history browser is open. The list runs newest first, so
@@ -934,7 +956,10 @@ impl App {
         if let Some(view) = self.cube_view.as_mut() {
             view.tick(now);
         }
-        if self.scramble.is_empty() {
+        // Only between solves: a scramble (and training case) that arrives
+        // during an attempt started without one isn't what is being solved,
+        // and `stop` saves whatever is in `scramble` with the solve.
+        if self.scramble.is_empty() && self.state == State::Idle {
             self.next_scramble();
         }
         if self
@@ -2658,6 +2683,44 @@ mod tests {
         key(&mut app, KeyCode::Char('x'));
         key(&mut app, KeyCode::Esc);
         assert_eq!(app.data.sessions[0].name, None);
+    }
+
+    #[test]
+    fn ctrl_and_alt_chords_are_not_typed_into_text() {
+        let mut app = App::new(true);
+        key(&mut app, KeyCode::Char('r'));
+        for m in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            app.on_key(
+                KeyEvent::new_with_kind(KeyCode::Char('w'), m, KeyEventKind::Press),
+                Instant::now(),
+            );
+        }
+        key(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.input.as_ref().unwrap().text, "x");
+    }
+
+    #[test]
+    fn a_scramble_that_arrives_mid_solve_is_not_saved_with_it() {
+        // a solve started before the first scramble was ready
+        let t = Instant::now();
+        let mut app = App::new(true);
+        app.inspection_on = false;
+        app.scramble.clear();
+        app.on_key(press(SPACE), t);
+        app.on_key(release(SPACE), at(t, 400));
+        assert!(matches!(app.state, State::Running { .. }));
+        // wait out the solver's tables, then give the next scramble time to
+        // arrive: ticks during the solve must not pick it up
+        app.scrambler.next();
+        for _ in 0..100 {
+            app.tick(Instant::now());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.scramble.is_empty(), "picked up during the solve");
+        app.on_key(press(SPACE), at(t, 5_000));
+        assert_eq!(app.solves()[0].scramble, "", "not what was solved");
+        settle(&mut app);
+        assert!(!app.scramble.is_empty(), "the next one comes once idle");
     }
 
     #[test]
